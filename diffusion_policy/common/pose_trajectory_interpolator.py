@@ -40,14 +40,14 @@ class PoseTrajectoryInterpolator:   # poses = [ [x,y,z,rx,ry,rz] ]
             pos = poses[:,:3]
             # rot = st.Rotation.from_rotvec(poses[:,3:])
             rot = st.Rotation.from_rotvec(poses[:,3:6])
-            # gripper = poses[:,6]
+            gripper = poses[:,6]
 
             self.pos_interp = si.interp1d(times, pos, 
                 axis=0, assume_sorted=True)
             self.rot_interp = st.Slerp(times, rot)
             # 추가됨
-            # self.gripper_interp = si.interp1d(times, gripper,
-            #     axis=0, assume_sorted=True)
+            self.gripper_interp = si.interp1d(times, gripper,
+                axis=0, assume_sorted=True)
 
     @property   # self.times
     def times(self) -> np.ndarray:
@@ -63,12 +63,11 @@ class PoseTrajectoryInterpolator:   # poses = [ [x,y,z,rx,ry,rz] ]
         else:
             # 수정됨
             n = len(self.times)
-            poses = np.zeros((n, 6))
-            # poses = np.zeros((n, 7))
+            poses = np.zeros((n, 7))
             poses[:,:3] = self.pos_interp.y   # pos
             # poses[:,3:] = self.rot_interp(self.times).as_rotvec()   # rot
             poses[:,3:6] = self.rot_interp(self.times).as_rotvec()   # rot
-            # poses[:,6] = self.gripper_interp.y   # gripper
+            poses[:,6] = self.gripper_interp.y   # gripper
             return poses
 
     def trim(self,   # start_t에서 end_t까지의 구간을 잘라냄
@@ -201,22 +200,21 @@ class PoseTrajectoryInterpolator:   # poses = [ [x,y,z,rx,ry,rz] ]
             is_single = True
             t = np.array([t])
         
-        pose = np.zeros((len(t), 6))
+        pose = np.zeros((len(t), 7))
         # pose = np.zeros((len(t), 7))
 
         if self.single_step:
-            pose[:] = self._poses[0]   # [x,y,z,rx,ry,rz]
+            pose[:] = self._poses[0]   # [x,y,z,rx,ry,rz,gripper]
         else:
             start_time = self.times[0]
             end_time = self.times[-1]
             t = np.clip(t, start_time, end_time)
 
-            pose = np.zeros((len(t), 6))
-            # pose = np.zeros((len(t), 7))
+            pose = np.zeros((len(t), 7))
             pose[:,:3] = self.pos_interp(t)
             # pose[:,3:] = self.rot_interp(t).as_rotvec()
             pose[:,3:6] = self.rot_interp(t).as_rotvec()
-            # pose[:,6] = self.gripper_interp(t)
+            pose[:,6] = self.gripper_interp(t)
 
         if is_single:
             pose = pose[0]

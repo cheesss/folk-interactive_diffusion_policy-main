@@ -108,7 +108,9 @@ class VideoRecorder:
             self.stop()
 
         self.container = av.open(file_path, mode='w')
-        self.stream = self.container.add_stream(self.codec, rate=self.fps)
+        # Convert fps to int for av library (it expects int or Rational, not float)
+        fps_int = int(round(self.fps))
+        self.stream = self.container.add_stream(self.codec, rate=fps_int)
         codec_context = self.stream.codec_context
         for k, v in self.kwargs.items():
             setattr(codec_context, k, v)

@@ -1,0 +1,63 @@
+# Ignore HDF5 files
+*.hdf5
+
+# Ignore MP4 video files
+*.mp4
+
+# Ignore checkpoint files
+*.ckpt
+
+# Ignore zip files
+*.zip
+
+# Ignore tar files
+*.tar
+
+# Ignore gz files
+*.gz
+
+# Ignore bz2 files
+*.bz2
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ROS2
+install/
+log/
+.ros/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data
+data/
+
+# python cache
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyz

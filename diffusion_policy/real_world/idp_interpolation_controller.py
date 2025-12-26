@@ -491,6 +491,7 @@ class RTDEInterpolationController(mp.Process):
             
             # use monotonic time to make sure the control loop never go backward
             curr_t = time.monotonic()
+            # Initialize last_waypoint_time in virtual time (starts at 0 pause duration)
             last_waypoint_time = curr_t
             # Initialize with current pose + current gripper position (7D: 3 pos + 3 rotvec + 1 gripper)
             curr_pose_with_gripper = np.concatenate([curr_pose, [current_gripper]])
@@ -503,6 +504,11 @@ class RTDEInterpolationController(mp.Process):
             keep_running = True
 
             t_start = time.monotonic()   # 수동 제어 주기 맞추기
+            
+            # Safety pause tracking
+            safety_halted = False
+            pause_start_time = None
+            pause_duration_total = 0.0
 
             while keep_running:   # 루프 시작
                 # start control iteration
@@ -513,7 +519,6 @@ class RTDEInterpolationController(mp.Process):
                 # diff = t_now - pose_interp.times[-1]
                 # if diff > 0:
                 #     print('extrapolate', diff)
-                pose_command = pose_interp(t_now)   # 보간 해놓고 현재 시간의 목표 pose 가져옴
                 # vel = 0.5
                 # acc = 0.5
                 # assert rtde_c.servoL(pose_command,   # 로봇 제어 부분! 바꾸기!
@@ -539,12 +544,42 @@ class RTDEInterpolationController(mp.Process):
                 curr_se3 = rb10.fkine(current_joint)   # m, rad (SE3)
                 curr_pose = se3_to_pos_rotvec(curr_se3)   
 
-                # 매니퓰레이터 및 그리퍼 제어                
-                servoJ_rb(rb10, current_joint, pose_command[:6], dt)   # servoJ (3 pos + 3 rotvec)
-                # ServoL(pose_command)                                 # servoL
-                # Control gripper (pose_command[6] is gripper value after converting 6D rot to 3D rotvec)
-                if len(pose_command) >= 7:
-                    self.ros2_node.gripper_control([pose_command[6]])
+                # Safety check: halt robot if filtered_distance is below threshold
+                with self.filtered_distance_lock:
+                    if self.filtered_distance is not None:
+                        is_safe = np.all(self.filtered_distance >= self.safety_threshold)
+                        
+                        if not is_safe and not safety_halted:
+                            # Just became unsafe - start pause
+                            min_distance = np.min(self.filtered_distance)
+                            print(f"[SAFETY] Filtered distance {min_distance:.4f} m below threshold {self.safety_threshold:.4f} m. Halting robot.")
+                            MotionHalt()
+                            safety_halted = True
+                            pause_start_time = t_now
+                        elif not is_safe and safety_halted:
+                            # Still unsafe - accumulate pause time
+                            if pause_start_time is not None:
+                                pause_duration_total += (t_now - pause_start_time)
+                                pause_start_time = t_now
+                        elif is_safe and safety_halted:
+                            # Just became safe - resume
+                            if pause_start_time is not None:
+                                pause_duration_total += (t_now - pause_start_time)
+                                pause_start_time = None
+                            print(f"[SAFETY] Filtered distance above threshold. Resuming robot movement.")
+                            safety_halted = False
+                
+                # Skip robot commands if safety halted
+                if not safety_halted:
+                    # 매니퓰레이터 및 그리퍼 제어                
+                    # Adjust t_now by pause duration to account for paused time
+                    adjusted_t_now = t_now - pause_duration_total
+                    pose_command = pose_interp(adjusted_t_now)   # 보간 해놓고 현재 시간의 목표 pose 가져옴
+                    servoJ_rb(rb10, current_joint, pose_command[:6], dt)   # servoJ (3 pos + 3 rotvec)
+                    # ServoL(pose_command)                                 # servoL
+                    # Control gripper (pose_command[6] is gripper value after converting 6D rot to 3D rotvec)
+                    if len(pose_command) >= 7:
+                        self.ros2_node.gripper_control([pose_command[6]])
 
 
                 # 현재 State 저장
@@ -638,18 +673,22 @@ class RTDEInterpolationController(mp.Process):
                         # print('[DEBUG] target rot_vec', target_pose[3:6])
 
                         target_time = float(command['target_time'])   # time.time 기준
-                        # translate global time to monotonic time
+                        # translate global time to monotonic time (absolute time)
                         target_time = time.monotonic() - time.time() + target_time   # time.monotonic 기준
-                        curr_time = t_now + dt
+                        # schedule_waypoint expects all times in absolute time (same frame as interpolator)
+                        # Use virtual time for curr_time calculation, then convert back to absolute
+                        curr_time_virtual = (t_now - pause_duration_total) + dt
+                        curr_time_absolute = curr_time_virtual + pause_duration_total  # Convert virtual to absolute
                         pose_interp = pose_interp.schedule_waypoint(   # 여기서 pose_interp 갱신
                             pose=target_pose,
-                            time=target_time,
+                            time=target_time,  # absolute time
                             max_pos_speed=self.max_pos_speed,
                             max_rot_speed=self.max_rot_speed,
-                            curr_time=curr_time,
-                            last_waypoint_time=last_waypoint_time
+                            curr_time=curr_time_absolute,  # absolute time
+                            last_waypoint_time=last_waypoint_time  # absolute time
                         )
-                        last_waypoint_time = target_time
+                        # Store last_waypoint_time in absolute time (from interpolator's internal times)
+                        last_waypoint_time = pose_interp.times[-1]
                     else:
                         keep_running = False
                         break

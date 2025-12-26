@@ -30,9 +30,9 @@ from diffusion_policy.common.cv2_util import (
 # }
 DEFAULT_OBS_KEY_MAP = {
     # robot
-    'robot_eef_pos': 'robot_eef_pos',
-    'robot_eef_quat': 'robot_eef_quat',
-    # 'robot_gripper_qpos': 'robot_gripper_qpos',
+    'robot_eef_pos': 'position',
+    'robot_eef_quat': 'quat',
+    'robot_gripper_qpos': 'gripper',
 
     # timestamps
     'step_idx': 'step_idx',
@@ -52,9 +52,7 @@ class RealEnv:
             max_obs_buffer_size=30,
             # camera_serial_numbers=None,
             # camera_serial_numbers=['117322071192', '126122270795'], # D435I, D405 
-            camera_serial_numbers=['126122270795', '117322071192'], # D405, D435I
-            # camera_serial_numbers=['231522070679', '117322071192'], # D435, D435I
-            # camera_serial_numbers=None,
+            camera_serial_numbers = [ '126122270795', '117322071192'],   # Wrist, Scene
             obs_key_map=DEFAULT_OBS_KEY_MAP,   
             obs_float32=False,
             # action
@@ -284,12 +282,18 @@ class RealEnv:
             out=self.last_realsense_data)
 
         # 125 hz, robot_receive_timestamp
-        last_robot_data = self.robot.get_all_state()   
-        # both have more than n_obs_steps data
-
+        # Use only recent data to avoid latency accumulation (get last k items instead of all)
+        robot_k = max(self.n_obs_steps * 3, 10)  # Get enough data for alignment, but not too much
+        last_robot_data = self.robot.get_state(k=robot_k)
+        
         # align camera obs timestamps
         dt = 1 / self.frequency
-        last_timestamp = np.max([x['timestamp'][-1] for x in self.last_realsense_data.values()])
+        # Use the most recent timestamp from camera data (not old buffered data)
+        # This prevents latency accumulation by ensuring we always use fresh timestamps
+        camera_last_timestamp = np.max([x['timestamp'][-1] for x in self.last_realsense_data.values()])
+        robot_last_timestamp = last_robot_data['robot_receive_timestamp'][-1] if len(last_robot_data['robot_receive_timestamp']) > 0 else camera_last_timestamp
+        # Use the most recent of camera or robot timestamps
+        last_timestamp = max(camera_last_timestamp, robot_last_timestamp)
         obs_align_timestamps = last_timestamp - (np.arange(self.n_obs_steps)[::-1] * dt)
 
         # 카메라 obs 데이터 얻기

@@ -1,7 +1,7 @@
 #!/home/vision/anaconda3/envs/robodiff/bin/python
 
 # 실행코드
-# python rb10_eval_real_robot.py --input data/outputs/2025.07.28/checkpoints_cnn/checkpoints/epoch\=1100-train_loss\=0.000.ckpt --output data/results
+# python rb10_eval_real_robot.py --input data/outputs/19.53.16_train_diffusion_unet_hybrid_son_pick_and_place_image/checkpoints/epoch\=0900-train_loss\=0.000.ckpt --output data/results
 """
 Usage:
 (robodiff)$ python eval_real_robot.py -i <ckpt_path> -o <save_dir> --robot_ip <ip_of_ur5>
@@ -161,7 +161,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 result = policy.predict_action(obs_dict)   # {'action': ~ , 'action_pred': ~}
                 # 실제 실행할 action trajectory
                 action = result['action'][0].detach().to('cpu').numpy()   # [0]은 배치차원 제거, tensor --> np
-                assert action.shape[-1] == 9   # action 차원에 맞게 바꿔주기
+                assert action.shape[-1] == 10   # action 차원: 3 pos + 6 rot + 1 gripper
                 del result
 
             print('Ready!')
