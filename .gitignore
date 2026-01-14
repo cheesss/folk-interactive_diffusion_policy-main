@@ -1,0 +1,35 @@
+# training outputs / logs
+outputs/
+data/outputs/
+**/wandb/
+**/wandb/**
+
+# checkpoints / snapshots / weights
+**/checkpoints/
+**/*.ckpt
+**/*.pth
+**/*.pt
+**/*.pkl
+**/*.npz
+
+# datasets
+**/*.hdf5
+**/*.h5
+**/*.zarr
+
+# papers
+**/*.pdf
+
+# logs
+**/*.log
+**/logs.json.txt
+
+# caches
+**/__pycache__/
+**/.ipynb_checkpoints/
+
+# generated media
+**/*.mp4
+**/*.gif
+outputs/
+wandb/

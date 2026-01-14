@@ -1,0 +1,32 @@
+name: son_pick_and_place_image_value
+
+image_shape: [3, 240, 320]
+dataset_path: /home/ws/Downloads/common_data_integ.hdf5
+
+shape_meta: &shape_meta
+  obs:
+    image0:
+      shape: [3, 240, 320]
+      type: rgb
+    image1:
+      shape: [3, 240, 320]
+      type: rgb
+    position:
+      shape: [3]
+      type: low_dim
+    quat:
+      shape: [4]
+      type: low_dim
+    gripper:
+      shape: [1]
+      type: low_dim
+  action: 
+    shape: [10]
+
+dataset:
+  _target_: diffusion_policy.dataset.son_replay_value_image_dataset.SonReplayValueImageDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  r_key: r
+  val_ratio: 0.1
+  seed: 42
