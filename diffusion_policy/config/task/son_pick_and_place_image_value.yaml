@@ -1,7 +1,7 @@
 name: son_pick_and_place_image_value
 
 image_shape: [3, 240, 320]
-dataset_path: /home/ws/Downloads/common_data_integ.hdf5
+dataset_path: /home/ws/Downloads/common_data_intg.hdf5
 
 shape_meta: &shape_meta
   obs:

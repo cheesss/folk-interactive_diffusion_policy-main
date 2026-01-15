@@ -98,7 +98,7 @@ def servoJ_rb(robot, current_joint, target_pose, dt, acc_pos_limit=40.0, acc_rot
     err_6d = np.concatenate((err_pos, err_rot_base))
 
     J = robot.jacob0(current_joint)
-    dq = np.linalg.pinv(J) @ err_6d
+    dq = np.linalg.pinv(J) @ err_6d 
 
     if np.linalg.norm(dq[:3]) > acc_pos_limit:
         dq[:3] *= acc_pos_limit / np.linalg.norm(dq[:3])

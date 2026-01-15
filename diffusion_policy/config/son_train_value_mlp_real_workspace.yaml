@@ -47,8 +47,8 @@ training:
   max_val_steps: null
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  val_every: 20
-  checkpoint_every: 20
+  val_every: 50
+  checkpoint_every: 50
   tqdm_interval_sec: 1.0
 
 logging:

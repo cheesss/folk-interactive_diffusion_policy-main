@@ -116,10 +116,18 @@ def process_demo(input_demo, output_demo, robot, resize_wh, r_key):
     output_obs.create_dataset(r_key, data=r)
     return len(r)
 
+file = ["/home/ws/Downloads/common_data (1).hdf5",
+        "/home/ws/Downloads/common_data (2).hdf5",
+        "/home/ws/Downloads/common_data (3).hdf5",
+        "/home/ws/Downloads/common_data (4).hdf5",
+        "/home/ws/Downloads/common_data (5).hdf5",
+        "/home/ws/Downloads/common_data (6).hdf5",
+        "/home/ws/Downloads/common_data (7).hdf5"]
+
 
 def main():
     parser = argparse.ArgumentParser(description="Postprocess + r/value_bin pipeline")
-    parser.add_argument("--input", nargs="+", required=True, help="Input HDF5 files")
+    parser.add_argument("--input", default=file, nargs="+", help="Input HDF5 files")
     parser.add_argument("--output", required=True, help="Output HDF5 file")
     parser.add_argument("--rb10_root", default="/home/ws/Desktop/robotory_rb10_ros2/scripts")
     parser.add_argument("--resize_w", type=int, default=320)
