@@ -79,6 +79,7 @@ dataloader:
   pin_memory: True
   persistent_workers: True
   use_advantage_sampler: True  # --adventage--
+  advantage_pos_fraction: 0.3  # --adventage--
 
 val_dataloader:
   batch_size: 64

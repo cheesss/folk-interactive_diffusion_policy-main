@@ -59,14 +59,16 @@ class TrainDiffusionUnetHybridAdvWorkspace(BaseWorkspace):
         self.global_step = 0
         self.epoch = 0
 
-    def _build_advantage_sampler(self, dataset) -> WeightedRandomSampler:
+    def _build_advantage_sampler(self, dataset, pos_fraction: float) -> WeightedRandomSampler:
         indicators = dataset.get_indicator_array()  # --adventage--
         count_0 = int((indicators == 0).sum())
         count_1 = int((indicators == 1).sum())
         if count_0 == 0 or count_1 == 0:
             raise RuntimeError("Advantage sampler requires both 0 and 1 classes")
-        weight_0 = 1.0 / count_0
-        weight_1 = 1.0 / count_1
+        pos_fraction = float(pos_fraction)
+        pos_fraction = min(max(pos_fraction, 0.0), 1.0)
+        weight_1 = pos_fraction / count_1
+        weight_0 = (1.0 - pos_fraction) / count_0
         samples_weight = np.where(indicators == 0, weight_0, weight_1)
         return WeightedRandomSampler(
             torch.as_tensor(samples_weight, dtype=torch.double),
@@ -92,7 +94,8 @@ class TrainDiffusionUnetHybridAdvWorkspace(BaseWorkspace):
         dataloader_kwargs = dict(cfg.dataloader)
         if dataloader_kwargs.get("use_advantage_sampler", False):
             dataloader_kwargs.pop("use_advantage_sampler")
-            sampler = self._build_advantage_sampler(dataset)  # --adventage--
+            pos_fraction = dataloader_kwargs.pop("advantage_pos_fraction", 0.5)
+            sampler = self._build_advantage_sampler(dataset, pos_fraction)  # --adventage--
             dataloader_kwargs["shuffle"] = False
             dataloader_kwargs["sampler"] = sampler
         train_dataloader = DataLoader(dataset, **dataloader_kwargs)
@@ -185,7 +188,8 @@ class TrainDiffusionUnetHybridAdvWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        raw_loss, per_sample = self.model.compute_loss(
+                            batch, return_per_sample=True)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
@@ -208,6 +212,16 @@ class TrainDiffusionUnetHybridAdvWorkspace(BaseWorkspace):
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
+                        adv = batch.get('advantage_indicator', None)
+                        if adv is not None:
+                            adv = adv.view(-1)
+                            per_sample = per_sample.view(-1)
+                            mask1 = adv == 1
+                            mask0 = adv == 0
+                            if torch.any(mask1):
+                                step_log['train_loss_adv1'] = per_sample[mask1].mean().item()
+                            if torch.any(mask0):
+                                step_log['train_loss_adv0'] = per_sample[mask0].mean().item()
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:

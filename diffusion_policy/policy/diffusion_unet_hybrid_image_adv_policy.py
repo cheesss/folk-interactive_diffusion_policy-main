@@ -294,7 +294,7 @@ class DiffusionUnetHybridImageAdvPolicy(BaseImagePolicy):
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
 
-    def compute_loss(self, batch):
+    def compute_loss(self, batch, return_per_sample: bool = False):
         # normalize input
         assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
@@ -365,5 +365,8 @@ class DiffusionUnetHybridImageAdvPolicy(BaseImagePolicy):
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        per_sample = loss.mean(dim=1)  # --adventage--
         loss = loss.mean()
+        if return_per_sample:
+            return loss, per_sample
         return loss

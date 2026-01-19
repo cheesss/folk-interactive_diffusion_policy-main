@@ -144,7 +144,8 @@ def main():
             )
 
             ret = np.cumsum(r[::-1], axis=0)[::-1]
-            ret_norm = ret / float(t_max)
+            remaining_steps = np.arange(len(r), 0, -1, dtype=np.float32)
+            ret_norm = ret / np.maximum(remaining_steps, 1.0)
             adv = ret_norm - v_norm
 
             _delete_if_exists(obs_group, args.adv_key)
