@@ -13,19 +13,24 @@ Press SpaceMouse right button to unlock z axis.
 Press SpaceMouse left button to enable rotation axes.
 
 Recording control:
-Click the opencv window (make sure it's in focus).
-Press "C" to start evaluation (hand control over to policy).
-Press "Q" to exit program.
+Press "C" in terminal to start evaluation (hand control over to policy).
+Press "Q" in terminal to exit program.
 
 ================ Policy in control ==============
 Make sure you can hit the robot hardware emergency-stop button quickly! 
 
 Recording control:
-Press "S" to stop evaluation and gain control back.
+Press "S" in terminal to pause inference.
+Press "C" in terminal to resume inference.
+Press "Q" in terminal to stop and exit.
 """
 
 # %%
 import time
+import sys
+import termios
+import tty
+import select
 from multiprocessing.managers import SharedMemoryManager
 import click
 import cv2
@@ -120,28 +125,34 @@ def _load_value_model(ckpt_path, device):
     return cfg, model
 
 
-def _build_key_window():
-    window_name = "KeyInput"
-    key_img = np.full((120, 240, 3), 0, dtype=np.uint8)
-    lines = [
-        "Focus this window",
-        "Press 's' to stop",
-    ]
-    y = 30
-    for line in lines:
-        cv2.putText(
-            key_img, line, (10, y),
-            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=0.6,
-            color=(0, 255, 0),
-            thickness=2,
-            lineType=cv2.LINE_AA
-        )
-        y += 28
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.imshow(window_name, key_img)
-    cv2.waitKey(1)
-    return window_name, key_img
+class _TerminalKeyReader:
+    def __init__(self):
+        self._enabled = sys.stdin.isatty()
+        self._old_settings = None
+
+    def start(self):
+        if not self._enabled:
+            return
+        fd = sys.stdin.fileno()
+        self._old_settings = termios.tcgetattr(fd)
+        tty.setraw(fd)
+
+    def stop(self):
+        if not self._enabled:
+            return
+        if self._old_settings is None:
+            return
+        fd = sys.stdin.fileno()
+        termios.tcsetattr(fd, termios.TCSADRAIN, self._old_settings)
+
+    def get_key(self):
+        if not self._enabled:
+            return None
+        if select.select([sys.stdin], [], [], 0)[0]:
+            ch = sys.stdin.read(1)
+            if ch:
+                return ch
+        return None
 
 
 def _write_value_video(out_path, frames_bgr, series, frame_indices, fps):
@@ -281,7 +292,8 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             video_crf=21,
             shm_manager=shm_manager) as env:
             cv2.setNumThreads(1)
-            key_window_name, key_img = _build_key_window()
+            key_reader = _TerminalKeyReader()
+            key_reader.start()
 
 
             # Realsense-viewer에서 설정
@@ -318,6 +330,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 del result
 
             print('Ready!')
+            stop_all = False
             while True:
                 
                 # ========== policy control loop ==============
@@ -341,7 +354,29 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     iter_idx = 0   # trajectory 실행 개수
                     term_area_start_timestamp = float('inf')
                     perv_target_pose = None
+                    paused = False
                     while True:
+                        key = key_reader.get_key()
+                        if key == 's':
+                            if not paused:
+                                paused = True
+                                print("Paused. Press 'c' to continue, 'q' to quit.")
+                        elif key == 'c':
+                            if paused:
+                                paused = False
+                                eval_t_start = time.time()
+                                t_start = time.monotonic()
+                                iter_idx = 0
+                                print("Resumed.")
+                        elif key == 'q' or key == '\x03':
+                            stop_all = True
+                            print("Stopping and exiting.")
+                            env.end_episode()
+                            break
+
+                        if paused:
+                            time.sleep(0.05)
+                            continue
                         # calculate timing; 실행할 action 만큼 기다릴 시간
                         t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
 
@@ -445,20 +480,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         print(f"Submitted {len(this_target_poses)} steps of actions.")
 
 
-                        # 's' 누르면 종료 (key window must be focused)
-                        cv2.imshow(key_window_name, key_img)
-                        key_stroke = cv2.waitKey(1) & 0xFF
-                        if key_stroke == ord('s'):
-                            # Stop episode
-                            # Hand control back to human
-                            env.end_episode()
-                            if value_model is not None:
-                                saved = _save_value_video_if_needed(
-                                    output, episode_idx, value_frames, value_series, value_frame_indices, fps=frequency)
-                                if saved is not None:
-                                    print(f"Saved value video to {saved}")
-                            print('Stopped.')
-                            break
+                        # 's' 누르면 종료는 터미널 입력에서 처리
 
 
                         # auto termination; 한계시간 지나면 종료
@@ -484,6 +506,8 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         if debug_timing:
                             print(f"[TIMING] after_wait t={time.time():.3f}")
                         iter_idx += steps_per_inference
+                    if stop_all:
+                        break
 
                 except KeyboardInterrupt:
                     print("Interrupted!")
@@ -496,6 +520,9 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             print(f"Saved value video to {saved}")
                 
                 print("Stopped.")
+                if stop_all:
+                    break
+            key_reader.stop()
 
 
 
