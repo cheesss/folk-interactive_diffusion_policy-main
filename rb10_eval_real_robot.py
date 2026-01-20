@@ -120,6 +120,30 @@ def _load_value_model(ckpt_path, device):
     return cfg, model
 
 
+def _build_key_window():
+    window_name = "KeyInput"
+    key_img = np.full((120, 240, 3), 0, dtype=np.uint8)
+    lines = [
+        "Focus this window",
+        "Press 's' to stop",
+    ]
+    y = 30
+    for line in lines:
+        cv2.putText(
+            key_img, line, (10, y),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=0.6,
+            color=(0, 255, 0),
+            thickness=2,
+            lineType=cv2.LINE_AA
+        )
+        y += 28
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.imshow(window_name, key_img)
+    cv2.waitKey(1)
+    return window_name, key_img
+
+
 def _write_value_video(out_path, frames_bgr, series, frame_indices, fps):
     out_path = str(out_path)
 
@@ -257,6 +281,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             video_crf=21,
             shm_manager=shm_manager) as env:
             cv2.setNumThreads(1)
+            key_window_name, key_img = _build_key_window()
 
 
             # Realsense-viewer에서 설정
@@ -420,8 +445,9 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         print(f"Submitted {len(this_target_poses)} steps of actions.")
 
 
-                        # 's' 누르면 종료
-                        key_stroke = cv2.pollKey()
+                        # 's' 누르면 종료 (key window must be focused)
+                        cv2.imshow(key_window_name, key_img)
+                        key_stroke = cv2.waitKey(1) & 0xFF
                         if key_stroke == ord('s'):
                             # Stop episode
                             # Hand control back to human
