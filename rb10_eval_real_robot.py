@@ -28,9 +28,8 @@ Press "Q" in terminal to stop and exit.
 # %%
 import time
 import sys
-import termios
-import tty
-import select
+import threading
+import queue
 from multiprocessing.managers import SharedMemoryManager
 import click
 import cv2
@@ -128,31 +127,36 @@ def _load_value_model(ckpt_path, device):
 class _TerminalKeyReader:
     def __init__(self):
         self._enabled = sys.stdin.isatty()
-        self._old_settings = None
+        self._queue = queue.Queue()
+        self._thread = None
+        self._stop = threading.Event()
 
     def start(self):
         if not self._enabled:
             return
-        fd = sys.stdin.fileno()
-        self._old_settings = termios.tcgetattr(fd)
-        tty.setraw(fd)
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
 
     def stop(self):
         if not self._enabled:
             return
-        if self._old_settings is None:
-            return
-        fd = sys.stdin.fileno()
-        termios.tcsetattr(fd, termios.TCSADRAIN, self._old_settings)
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+
+    def _reader(self):
+        while not self._stop.is_set():
+            ch = sys.stdin.read(1)
+            if ch:
+                self._queue.put(ch)
 
     def get_key(self):
         if not self._enabled:
             return None
-        if select.select([sys.stdin], [], [], 0)[0]:
-            ch = sys.stdin.read(1)
-            if ch:
-                return ch
-        return None
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
 
 
 def _write_value_video(out_path, frames_bgr, series, frame_indices, fps):
