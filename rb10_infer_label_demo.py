@@ -2,6 +2,11 @@ import os
 import time
 import pathlib
 import copy
+import sys
+import threading
+import queue
+import termios
+import tty
 import h5py
 import numpy as np
 import cv2
@@ -21,6 +26,45 @@ from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.rb10_api.cobot import GetCurrentJoint, MoveJ
+
+
+class _TerminalKeyReader:
+    def __init__(self):
+        self._enabled = sys.stdin.isatty()
+        self._queue = queue.Queue()
+        self._thread = None
+        self._stop = threading.Event()
+
+    def start(self):
+        if not self._enabled:
+            return
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if not self._enabled:
+            return
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+
+    def _reader(self):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        while not self._stop.is_set():
+            ch = sys.stdin.read(1)
+            if ch:
+                self._queue.put(ch)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def get_key(self):
+        if not self._enabled:
+            return None
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
 
 
 def _init_demo_buffer():
@@ -90,11 +134,11 @@ def _prompt_yes_no(msg):
             return ans == "y"
 
 
-def _wait_for_key(key_char, idle_sleep=0.05):
-    print(f"Press '{key_char}' to continue.")
+def _wait_for_key(key_char, key_reader, idle_sleep=0.05):
+    print(f"Press '{key_char}' in terminal to continue.")
     while True:
-        key = cv2.pollKey()
-        if key == ord(key_char):
+        key = key_reader.get_key()
+        if key == key_char:
             return
         time.sleep(idle_sleep)
 
@@ -116,7 +160,11 @@ def _move_home(joints, speed, acc):
 @click.option("--max_duration", "-md", default=60, help="Max duration per demo (sec)")
 @click.option("--frequency", "-f", default=10, type=float, help="Control frequency in Hz")
 @click.option("--command_latency", "-cl", default=0.01, type=float, help="Command latency in sec")
-@click.option("--home_joints", default=None, help="Home joint angles in rad, comma-separated (6 values)")
+@click.option(
+    "--home_joints",
+    default="88.82315826,1.57005262,-108.45492554,16.88487434,-89.99609375,1.24207485",
+    help="Home joint angles in deg, comma-separated (6 values)",
+)
 @click.option("--home_speed", default=1.05, type=float)
 @click.option("--home_acc", default=1.4, type=float)
 def main(input, output, hdf5, robot_ip, vis_camera_idx, steps_per_inference,
@@ -180,6 +228,8 @@ def main(input, output, hdf5, robot_ip, vis_camera_idx, steps_per_inference,
             shm_manager=shm_manager,
         ) as env:
             cv2.setNumThreads(1)
+            key_reader = _TerminalKeyReader()
+            key_reader.start()
             print("Waiting for realsense...")
             time.sleep(1.0)
 
@@ -189,88 +239,91 @@ def main(input, output, hdf5, robot_ip, vis_camera_idx, steps_per_inference,
             obs_dict = dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
             _ = policy.predict_action(obs_dict)
 
-            while True:
-                _move_home(home_joints, home_speed, home_acc)
-                _wait_for_key("s")
-
-                demo_buffer = _init_demo_buffer()
-                pending_label = True
-                t_start = time.monotonic()
-                iter_idx = 0
-
+            try:
                 while True:
-                    obs = env.get_obs()
-                    frame = _to_uint8(obs[vis_rgb_key][-1])
-                    cv2.imshow("rb10_infer", frame[..., ::-1])
-                    cv2.pollKey()
+                    _move_home(home_joints, home_speed, home_acc)
+                    _wait_for_key("s", key_reader)
 
-                    # record current observation
-                    if pending_label:
-                        _append_demo_obs(demo_buffer, obs, -1)
-                    else:
-                        _append_demo_obs(demo_buffer, obs, 0)
+                    demo_buffer = _init_demo_buffer()
+                    pending_label = True
+                    t_start = time.monotonic()
+                    iter_idx = 0
 
-                    # inference + action execution
-                    with torch.no_grad():
-                        obs_dict_np = get_real_obs_dict(env_obs=obs, shape_meta=cfg.task.shape_meta)
-                        obs_dict = dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
-                        result = policy.predict_action(obs_dict)
-                        action = result["action"][0].detach().to("cpu").numpy()
+                    while True:
+                        obs = env.get_obs()
+                        frame = _to_uint8(obs[vis_rgb_key][-1])
+                        cv2.imshow("rb10_infer", frame[..., ::-1])
+                        cv2.waitKey(1)
 
-                    this_target_poses = np.zeros((len(action), action.shape[-1]), dtype=np.float64)
-                    this_target_poses[:, :action.shape[-1]] = action
+                        # record current observation
+                        if pending_label:
+                            _append_demo_obs(demo_buffer, obs, -1)
+                        else:
+                            _append_demo_obs(demo_buffer, obs, 0)
 
-                    action_timestamps = (np.arange(len(action), dtype=np.float64) + action_offset) * dt + obs["timestamp"][-1]
-                    curr_time = time.time()
-                    is_new = action_timestamps > (curr_time + command_latency)
-                    if np.sum(is_new) == 0:
-                        this_target_poses = this_target_poses[[-1]]
-                        next_step_idx = int(np.ceil((curr_time - time.time()) / dt))
-                        action_timestamp = time.time() + (next_step_idx) * dt
-                        action_timestamps = np.array([action_timestamp])
-                    else:
-                        this_target_poses = this_target_poses[is_new]
-                        action_timestamps = action_timestamps[is_new]
+                        # inference + action execution
+                        with torch.no_grad():
+                            obs_dict_np = get_real_obs_dict(env_obs=obs, shape_meta=cfg.task.shape_meta)
+                            obs_dict = dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
+                            result = policy.predict_action(obs_dict)
+                            action = result["action"][0].detach().to("cpu").numpy()
 
-                    env.exec_actions(actions=this_target_poses, timestamps=action_timestamps)
+                        this_target_poses = np.zeros((len(action), action.shape[-1]), dtype=np.float64)
+                        this_target_poses[:, :action.shape[-1]] = action
 
-                    key = cv2.pollKey()
-                    if key == ord("q"):
-                        print("Quit requested.")
-                        return
-                    if key == ord("0"):
-                        _set_pending_labels(demo_buffer, 0)
-                        pending_label = False
-                        if _prompt_yes_no("Start teleop now?"):
-                            print("Teleop recording... Press 'c' to finish.")
-                            while True:
-                                obs = env.get_obs()
-                                frame = _to_uint8(obs[vis_rgb_key][-1])
-                                cv2.imshow("rb10_infer", frame[..., ::-1])
-                                cv2.pollKey()
-                                _append_demo_obs(demo_buffer, obs, 1)
-                                key2 = cv2.pollKey()
-                                if key2 == ord("c"):
-                                    if _prompt_yes_no("Save demo?"):
-                                        _save_demo_hdf5(demo_buffer, hdf5_path)
-                                    break
-                                if key2 == ord("q"):
-                                    print("Quit requested.")
-                                    return
-                                precise_wait(1.0 / frequency)
+                        action_timestamps = (np.arange(len(action), dtype=np.float64) + action_offset) * dt + obs["timestamp"][-1]
+                        curr_time = time.time()
+                        is_new = action_timestamps > (curr_time + command_latency)
+                        if np.sum(is_new) == 0:
+                            this_target_poses = this_target_poses[[-1]]
+                            next_step_idx = int(np.ceil((curr_time - time.time()) / dt))
+                            action_timestamp = time.time() + (next_step_idx) * dt
+                            action_timestamps = np.array([action_timestamp])
+                        else:
+                            this_target_poses = this_target_poses[is_new]
+                            action_timestamps = action_timestamps[is_new]
+
+                        env.exec_actions(actions=this_target_poses, timestamps=action_timestamps)
+
+                        key = key_reader.get_key()
+                        if key == "q":
+                            print("Quit requested.")
+                            return
+                        if key == "0":
+                            _set_pending_labels(demo_buffer, 0)
+                            pending_label = False
+                            if _prompt_yes_no("Start teleop now?"):
+                                print("Teleop recording... Press 'c' to finish.")
+                                while True:
+                                    obs = env.get_obs()
+                                    frame = _to_uint8(obs[vis_rgb_key][-1])
+                                    cv2.imshow("rb10_infer", frame[..., ::-1])
+                                    cv2.waitKey(1)
+                                    _append_demo_obs(demo_buffer, obs, 1)
+                                    key2 = key_reader.get_key()
+                                    if key2 == "c":
+                                        if _prompt_yes_no("Save demo?"):
+                                            _save_demo_hdf5(demo_buffer, hdf5_path)
+                                        break
+                                    if key2 == "q":
+                                        print("Quit requested.")
+                                        return
+                                    precise_wait(1.0 / frequency)
+                                break
+                        if key == "1":
+                            _set_pending_labels(demo_buffer, 1)
+                            pending_label = False
+                            if _prompt_yes_no("Save demo?"):
+                                _save_demo_hdf5(demo_buffer, hdf5_path)
                             break
-                    if key == ord("1"):
-                        _set_pending_labels(demo_buffer, 1)
-                        pending_label = False
-                        if _prompt_yes_no("Save demo?"):
-                            _save_demo_hdf5(demo_buffer, hdf5_path)
-                        break
 
-                    if time.monotonic() - t_start > max_duration:
-                        print("Timeout reached.")
-                        break
+                        if time.monotonic() - t_start > max_duration:
+                            print("Timeout reached.")
+                            break
 
-                    precise_wait(1.0 / frequency)
+                        precise_wait(1.0 / frequency)
+            finally:
+                key_reader.stop()
 
 
 if __name__ == "__main__":

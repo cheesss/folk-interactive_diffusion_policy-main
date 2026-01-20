@@ -30,6 +30,8 @@ import time
 import sys
 import threading
 import queue
+import termios
+import tty
 from multiprocessing.managers import SharedMemoryManager
 import click
 import cv2
@@ -145,10 +147,14 @@ class _TerminalKeyReader:
             self._thread.join(timeout=0.5)
 
     def _reader(self):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
         while not self._stop.is_set():
             ch = sys.stdin.read(1)
             if ch:
                 self._queue.put(ch)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def get_key(self):
         if not self._enabled:
