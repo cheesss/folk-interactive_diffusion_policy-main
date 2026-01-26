@@ -124,6 +124,8 @@ class Command(enum.Enum):
     STOP = 0
     SERVOL = 1
     SCHEDULE_WAYPOINT = 2
+    DIRECT_SERVO = 3
+    RESET_INTERP = 4
 
 
 class RTDENode(Node):
@@ -399,6 +401,23 @@ class RTDEInterpolationController(mp.Process):
         }
         self.input_queue.put(message)
 
+    def direct_servo(self, pose):
+        assert self.is_alive()
+        pose = np.array(pose)
+        assert pose.shape == (10,)  # 3 pos + 6 rot + 1 gripper
+        message = {
+            'cmd': Command.DIRECT_SERVO.value,
+            'target_pose': pose
+        }
+        self.input_queue.put(message)
+
+    def reset_interpolator(self):
+        assert self.is_alive()
+        message = {
+            'cmd': Command.RESET_INTERP.value
+        }
+        self.input_queue.put(message)
+
     # ========= receive APIs =============
     def get_state(self, k=None, out=None):
         if k is None:
@@ -594,6 +613,21 @@ class RTDEInterpolationController(mp.Process):
                         keep_running = False
                         # stop immediately, ignore later commands
                         break
+                    elif cmd == Command.RESET_INTERP.value:
+                        with self.gripper_pos_lock:
+                            if self.gripper_pos is not None:
+                                current_gripper = float(self.gripper_pos)
+                            else:
+                                current_gripper = 2100.0
+                        curr_time = t_now + dt
+                        curr_pose_with_gripper = np.concatenate([curr_pose, [current_gripper]])
+                        pose_interp = PoseTrajectoryInterpolator(
+                            times=np.array([curr_time]),
+                            poses=np.array([curr_pose_with_gripper])
+                        )
+                        last_waypoint_time = curr_time
+                        if self.verbose:
+                            print("[RTDEPositionalController] Interpolator reset.")
                     # elif cmd == Command.SERVOL.value:   # SERVOL: target_pose 실행 
                     #     # since curr_pose always lag behind curr_target_pose
                     #     # if we start the next interpolation with curr_pose
@@ -650,6 +684,40 @@ class RTDEInterpolationController(mp.Process):
                             last_waypoint_time=last_waypoint_time
                         )
                         last_waypoint_time = target_time
+                    elif cmd == Command.DIRECT_SERVO.value:
+                        target_pose = command['target_pose']   # abs; 3d pose, 6d rotation, 1d gripper (10D)
+                        target_position = target_pose[:3]
+                        target_rotvec = rot6d_to_rotvec(target_pose[3:9])
+                        target_gripper = target_pose[9:10]
+                        target_pose_7d = np.concatenate([target_position, target_rotvec, target_gripper])
+
+                        # refresh current joint before direct servo
+                        with self.joint_state_lock:
+                            if self.joint_state is not None:
+                                current_joint = self.joint_state.copy()
+                            else:
+                                j = GetCurrentJoint()
+                                current_joint = np.array([j.j0, j.j1, j.j2, j.j3, j.j4, j.j5]) * np.pi / 180
+                        curr_se3 = rb10.fkine(current_joint)
+                        curr_pose = se3_to_pos_rotvec(curr_se3)
+
+                        servoJ_rb(rb10, current_joint, target_pose_7d[:6], dt)
+                        if len(target_pose_7d) >= 7:
+                            self.ros2_node.gripper_control([target_pose_7d[6]])
+
+                        # reset interpolator to current state to avoid stale trajectory
+                        with self.gripper_pos_lock:
+                            if self.gripper_pos is not None:
+                                current_gripper = float(self.gripper_pos)
+                            else:
+                                current_gripper = 2100.0
+                        curr_time = t_now + dt
+                        curr_pose_with_gripper = np.concatenate([curr_pose, [current_gripper]])
+                        pose_interp = PoseTrajectoryInterpolator(
+                            times=np.array([curr_time]),
+                            poses=np.array([curr_pose_with_gripper])
+                        )
+                        last_waypoint_time = curr_time
                     else:
                         keep_running = False
                         break
