@@ -1,0 +1,41 @@
+name: son_pick_and_place_image_adv
+
+image_shape: [3, 240, 320]
+dataset_path: /home/ws/Downloads/common_data_intg.hdf5
+
+shape_meta: &shape_meta
+  obs:
+    image0:
+      shape: [3, 240, 320]
+      type: rgb
+    image1:
+      shape: [3, 240, 320]
+      type: rgb
+    position:
+      shape: [3]
+      type: low_dim
+    quat:
+      shape: [4]
+      type: low_dim
+    gripper:
+      shape: [1]
+      type: low_dim
+  action:
+    shape: [10]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.son_replay_image_adv_dataset.SonReplayImageAdvDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  use_cache: False
+  seed: 42
+  val_ratio: 0.1
+  abs_action: True
+  advantage_indicator_key: advantage_indicator  # --adventage--

@@ -390,43 +390,10 @@ class RealEnv:
                 new_stages,
                 new_timestamps
             )
-
-
-    def exec_direct_actions(self,
-            actions: np.ndarray,
-            stages: Optional[np.ndarray]=None):
-        assert self.is_ready
-        if not isinstance(actions, np.ndarray):
-            actions = np.array(actions)
-        if stages is None:
-            stages = np.zeros((len(actions),), dtype=np.int64)
-        elif not isinstance(stages, np.ndarray):
-            stages = np.array(stages, dtype=np.int64)
-
-        now = time.time()
-        timestamps = np.full((len(actions),), now, dtype=np.float64)
-
-        for i in range(len(actions)):
-            self.robot.direct_servo(actions[i])
-
-        if self.action_accumulator is not None:
-            self.action_accumulator.put(
-                actions,
-                timestamps
-            )
-        if self.stage_accumulator is not None:
-            self.stage_accumulator.put(
-                stages,
-                timestamps
-            )
     
     
     def get_robot_state(self):
         return self.robot.get_state()
-
-    def reset_interpolator(self):
-        if hasattr(self.robot, "reset_interpolator"):
-            self.robot.reset_interpolator()
 
     # recording API
     def start_episode(self, start_time=None):
@@ -468,7 +435,12 @@ class RealEnv:
     
     def end_episode(self):
         "Stop recording"
-        assert self.is_ready
+        if not self.is_ready:
+            # If startup failed, avoid crashing on shutdown.
+            self.obs_accumulator = None
+            self.action_accumulator = None
+            self.stage_accumulator = None
+            return
         
         # stop video recorder
         self.realsense.stop_recording()

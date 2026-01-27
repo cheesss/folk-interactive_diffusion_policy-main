@@ -1,0 +1,72 @@
+defaults:
+  - _self_
+  - task: son_pick_and_place_image_value
+
+name: train_value_mlp_real
+_target_: diffusion_policy.workspace.train_value_image_workspace.TrainValueImageWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+model:
+  _target_: diffusion_policy.model.value.value_mlp.ValueImageMLP
+  shape_meta: ${shape_meta}
+  hidden_dims: [256, 256]
+  crop_shape: [216, 288]
+  obs_encoder_group_norm: True
+  eval_fixed_crop: True
+
+dataloader:
+  batch_size: 64
+  num_workers: 24
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 24
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  num_epochs: 1000
+  max_train_steps: null
+  max_val_steps: null
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  val_every: 20
+  checkpoint_every: 20
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_value
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.4f}.ckpt'
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d_%H-%M-%S}

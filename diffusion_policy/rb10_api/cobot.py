@@ -1,6 +1,7 @@
 from socket import *
 import threading
 import time
+import os
 import struct
 from dataclasses import dataclass
 from enum import Enum
@@ -217,7 +218,8 @@ def GetCurrentJoint():
                                systemstat_global.jnt_ref[5])
         return current_joint_
     else:
-        print("'data socket isn't connect")
+        if os.environ.get("RB10_SILENCE_DATA_SOCKET", "0") != "1":
+            print("'data socket isn't connect")
         current_joint_ = Joint(0, 0, 0, 0, 0, 0)
         return current_joint_
 
@@ -228,7 +230,8 @@ def GetCurrentSplitedJoint():
                           , systemstat_global.jnt_ref[3], systemstat_global.jnt_ref[4], systemstat_global.jnt_ref[5])
         return current_joint_
     else:
-        print("'data socket isn't connect")
+        if os.environ.get("RB10_SILENCE_DATA_SOCKET", "0") != "1":
+            print("'data socket isn't connect")
         current_joint_ = (0, 0, 0, 0, 0, 0)
         return current_joint_
 
@@ -241,7 +244,8 @@ def GetCurrentTCP():
                              systemstat_global.tcp_ref[5])
         return current_tcp_
     else:
-        print("'data socket isn't connect")
+        if os.environ.get("RB10_SILENCE_DATA_SOCKET", "0") != "1":
+            print("'data socket isn't connect")
         current_tcp_ = Point(0, 0, 0, 0, 0, 0)
         return current_tcp_
 
@@ -254,7 +258,8 @@ def GetCurrentSplitedTCP():
                         systemstat_global.tcp_ref[5])
         return current_tcp_
     else:
-        print("'data socket isn't connect")
+        if os.environ.get("RB10_SILENCE_DATA_SOCKET", "0") != "1":
+            print("'data socket isn't connect")
         current_tcp_ = ()
         return current_tcp_
 

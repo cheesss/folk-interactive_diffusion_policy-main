@@ -35,6 +35,26 @@ def gripper_callback(msg):
     latest_gripper_qpos = [msg.gGWD]
     # print("[DEBUG] gripper callback received:", latest_gripper_qpos[0])
 
+#
+def get_speed_scaling_factor(distance):
+    # Proximity sensor range: 0 to 200
+    # Full speed when distance is above 100
+    if distance > 100:
+        return 1.0
+    
+    # Emergency stop when distance is 30 or less
+    elif distance <= 30:
+        return 0.0
+    
+    # Gradual slow down between 100 and 30
+    else:
+        # Linear interpolation: (current - min) / (max - min)
+        # result moves from 1.0 to 0.0 as distance decreases
+        scaling_factor = (distance - 30) / (100 - 30)
+        return scaling_factor
+
+
+
 
 def rot6d_to_rotvec(rot6d: np.ndarray) -> np.ndarray:
    
@@ -106,7 +126,7 @@ def servoJ_rb(robot, current_joint, target_pose, dt, acc_pos_limit=40.0, acc_rot
     if np.linalg.norm(dq[3:]) > acc_rot_limit:
         dq[3:] *= acc_rot_limit / np.linalg.norm(dq[3:])
     
-    next_joint = current_joint + dq * 1.0
+    next_joint = current_joint + dq * 0.6
     ServoJ(next_joint * 180 / np.pi, time1=dt)
 
 
@@ -132,6 +152,8 @@ class RTDENode(Node):
         super().__init__('rtde_interpolation_controller')
         self.controller = controller
         self.reentrant_group = ReentrantCallbackGroup()
+        self._seen_joint = False
+        self._seen_gripper = False
         
         # Create subscribers for joint state and gripper position
         self.joint_state_sub = self.create_subscription(
@@ -152,7 +174,8 @@ class RTDENode(Node):
 
         self.filtered_distance_sub = self.create_subscription(
             Float32MultiArray,
-            '/filtered_distance',
+            # '/filtered_distance',
+            '/proximity_distance',
             self.filtered_distance_callback,
             10,
             callback_group=self.reentrant_group
@@ -171,17 +194,26 @@ class RTDENode(Node):
             if len(msg.position) >= 6:
                 # Store joint positions in radians
                 self.controller.joint_state = np.array(msg.position[:6])
+        if not self._seen_joint:
+            self.get_logger().info("Received /joint_states")
+            self._seen_joint = True
     
     def gripper_pos_callback(self, msg):
         """Callback for gripper position subscription (Int32 message)"""
         with self.controller.gripper_pos_lock:
             self.controller.gripper_pos = msg.data
+        if not self._seen_gripper:
+            self.get_logger().info("Received /gripper/present_position")
+            self._seen_gripper = True
     
     def filtered_distance_callback(self, msg):
         """Callback for filtered distance subscription (Float32MultiArray message)"""
         with self.controller.filtered_distance_lock:
             # Convert Float32MultiArray to numpy array
             self.controller.filtered_distance = np.array(msg.data, dtype=np.float32)
+            if len(self.controller.filtered_distance) > 0:
+                print(f"[DEBUG] Sensor Distance Received: {self.controller.filtered_distance[0]:.2f}")
+
 
 
 class RTDEInterpolationController(mp.Process):
@@ -421,20 +453,25 @@ class RTDEInterpolationController(mp.Process):
 
         # rtde_c = RTDEControlInterface(hostname=robot_ip)   # 바꾸기!
         # rtde_r = RTDEReceiveInterface(hostname=robot_ip)   # 바꾸기!
+        print(f"[RTDE] starting controller for {robot_ip}")
         ToCB(ip=robot_ip)
+        print("[RTDE] connected to CB")
         rb10 = RB10()
         CobotInit()
+        print("[RTDE] CobotInit done")
 
         # Real or Simulation
         SetProgramMode(PG_MODE.REAL)
         # SetProgramMode(PG_MODE.SIMULATION)
 
 
-        # Initialize ROS2
-        rclpy.init(args=None)
+        # Initialize ROS2 (guard against double init)
+        if not rclpy.ok():
+            rclpy.init(args=None)
         
         # Create ROS2 node for subscriptions
         self.ros2_node = RTDENode(self)
+        print("[RTDE] ROS2 node created")
         
         # Create executor to process ROS2 callbacks in separate thread (similar to dataset_gen.py)
         executor = MultiThreadedExecutor(num_threads=4)
@@ -464,7 +501,8 @@ class RTDEInterpolationController(mp.Process):
             # init pose
             if self.joints_init is not None:   # None
                 # assert rtde_c.moveJ(self.joints_init, self.joints_init_speed, 1.4)
-                MoveJ(self.joints_init, self.joints_init_speed, 1.4)
+                MoveJ(*self.joints_init.tolist(), self.joints_init_speed, 1.4)
+            print("[RTDE] init pose complete")
 
             # main loop
             dt = 1. / self.frequency
@@ -478,6 +516,7 @@ class RTDEInterpolationController(mp.Process):
                     current_joint = np.array([j.j0, j.j1, j.j2, j.j3, j.j4, j.j5]) * np.pi / 180   # rad
                 else:
                     current_joint = self.joint_state.copy()
+            print("[RTDE] initial joint state ready")
             
             # Get current gripper position from subscription
             with self.gripper_pos_lock:
@@ -485,13 +524,13 @@ class RTDEInterpolationController(mp.Process):
                     current_gripper = float(self.gripper_pos)
                 else:
                     current_gripper = 2100  # Fallback to open state if not received yet
+            print("[RTDE] initial gripper state ready")
             
             curr_se3 = rb10.fkine(current_joint)   # m, rad (SE3)
             curr_pose = se3_to_pos_rotvec(curr_se3)   
-            
+
             # use monotonic time to make sure the control loop never go backward
             curr_t = time.monotonic()
-            # Initialize last_waypoint_time in virtual time (starts at 0 pause duration)
             last_waypoint_time = curr_t
             # Initialize with current pose + current gripper position (7D: 3 pos + 3 rotvec + 1 gripper)
             curr_pose_with_gripper = np.concatenate([curr_pose, [current_gripper]])
@@ -504,11 +543,6 @@ class RTDEInterpolationController(mp.Process):
             keep_running = True
 
             t_start = time.monotonic()   # 수동 제어 주기 맞추기
-            
-            # Safety pause tracking
-            safety_halted = False
-            pause_start_time = None
-            pause_duration_total = 0.0
 
             while keep_running:   # 루프 시작
                 # start control iteration
@@ -519,6 +553,7 @@ class RTDEInterpolationController(mp.Process):
                 # diff = t_now - pose_interp.times[-1]
                 # if diff > 0:
                 #     print('extrapolate', diff)
+                pose_command = pose_interp(t_now)   # 보간 해놓고 현재 시간의 목표 pose 가져옴
                 # vel = 0.5
                 # acc = 0.5
                 # assert rtde_c.servoL(pose_command,   # 로봇 제어 부분! 바꾸기!
@@ -544,42 +579,12 @@ class RTDEInterpolationController(mp.Process):
                 curr_se3 = rb10.fkine(current_joint)   # m, rad (SE3)
                 curr_pose = se3_to_pos_rotvec(curr_se3)   
 
-                # Safety check: halt robot if filtered_distance is below threshold
-                with self.filtered_distance_lock:
-                    if self.filtered_distance is not None:
-                        is_safe = np.all(self.filtered_distance >= self.safety_threshold)
-                        
-                        if not is_safe and not safety_halted:
-                            # Just became unsafe - start pause
-                            min_distance = np.min(self.filtered_distance)
-                            print(f"[SAFETY] Filtered distance {min_distance:.4f} m below threshold {self.safety_threshold:.4f} m. Halting robot.")
-                            MotionHalt()
-                            safety_halted = True
-                            pause_start_time = t_now
-                        elif not is_safe and safety_halted:
-                            # Still unsafe - accumulate pause time
-                            if pause_start_time is not None:
-                                pause_duration_total += (t_now - pause_start_time)
-                                pause_start_time = t_now
-                        elif is_safe and safety_halted:
-                            # Just became safe - resume
-                            if pause_start_time is not None:
-                                pause_duration_total += (t_now - pause_start_time)
-                                pause_start_time = None
-                            print(f"[SAFETY] Filtered distance above threshold. Resuming robot movement.")
-                            safety_halted = False
-                
-                # Skip robot commands if safety halted
-                if not safety_halted:
-                    # 매니퓰레이터 및 그리퍼 제어                
-                    # Adjust t_now by pause duration to account for paused time
-                    adjusted_t_now = t_now - pause_duration_total
-                    pose_command = pose_interp(adjusted_t_now)   # 보간 해놓고 현재 시간의 목표 pose 가져옴
-                    servoJ_rb(rb10, current_joint, pose_command[:6], dt)   # servoJ (3 pos + 3 rotvec)
-                    # ServoL(pose_command)                                 # servoL
-                    # Control gripper (pose_command[6] is gripper value after converting 6D rot to 3D rotvec)
-                    if len(pose_command) >= 7:
-                        self.ros2_node.gripper_control([pose_command[6]])
+                # 매니퓰레이터 및 그리퍼 제어                
+                servoJ_rb(rb10, current_joint, pose_command[:6], dt)   # servoJ (3 pos + 3 rotvec)
+                # ServoL(pose_command)                                 # servoL
+                # Control gripper (pose_command[6] is gripper value after converting 6D rot to 3D rotvec)
+                if len(pose_command) >= 7:
+                    self.ros2_node.gripper_control([pose_command[6]])
 
 
                 # 현재 State 저장
@@ -663,7 +668,7 @@ class RTDEInterpolationController(mp.Process):
                         target_gripper = target_pose[9:10]  # gripper (keep as array for concatenation)
                         target_pose = np.concatenate([target_position, target_rotvec, target_gripper])   # 3d position, 3d rot_vec, 1d gripper (7D)
 
-                        print('[DEBUG] target_pose', target_pose)
+                        # print('[DEBUG] target_pose', target_pose)
                         
                         # print('[DEBUG] current rot_vec', curr_pose[3:6])
                         # target_pose[:3] = curr_pose[:3] + target_pose[:3] * MAX_TRANS   # pose, meter
@@ -673,22 +678,18 @@ class RTDEInterpolationController(mp.Process):
                         # print('[DEBUG] target rot_vec', target_pose[3:6])
 
                         target_time = float(command['target_time'])   # time.time 기준
-                        # translate global time to monotonic time (absolute time)
+                        # translate global time to monotonic time
                         target_time = time.monotonic() - time.time() + target_time   # time.monotonic 기준
-                        # schedule_waypoint expects all times in absolute time (same frame as interpolator)
-                        # Use virtual time for curr_time calculation, then convert back to absolute
-                        curr_time_virtual = (t_now - pause_duration_total) + dt
-                        curr_time_absolute = curr_time_virtual + pause_duration_total  # Convert virtual to absolute
+                        curr_time = t_now + dt
                         pose_interp = pose_interp.schedule_waypoint(   # 여기서 pose_interp 갱신
                             pose=target_pose,
-                            time=target_time,  # absolute time
+                            time=target_time,
                             max_pos_speed=self.max_pos_speed,
                             max_rot_speed=self.max_rot_speed,
-                            curr_time=curr_time_absolute,  # absolute time
-                            last_waypoint_time=last_waypoint_time  # absolute time
+                            curr_time=curr_time,
+                            last_waypoint_time=last_waypoint_time
                         )
-                        # Store last_waypoint_time in absolute time (from interpolator's internal times)
-                        last_waypoint_time = pose_interp.times[-1]
+                        last_waypoint_time = target_time
                     else:
                         keep_running = False
                         break

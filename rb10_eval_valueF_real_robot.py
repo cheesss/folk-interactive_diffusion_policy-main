@@ -1,0 +1,500 @@
+#!/home/vision/anaconda3/envs/robodiff/bin/python
+
+# 실행코드
+# python rb10_eval_real_robot.py --input data/outputs/19.53.16_train_diffusion_unet_hybrid_son_pick_and_place_image/checkpoints/epoch\=0900-train_loss\=0.000.ckpt --output data/results
+"""
+Usage:
+(robodiff)$ python eval_real_robot.py -i <ckpt_path> -o <save_dir> --robot_ip <ip_of_ur5>
+
+================ Human in control ==============
+Robot movement:
+Move your SpaceMouse to move the robot EEF (locked in xy plane).
+Press SpaceMouse right button to unlock z axis.
+Press SpaceMouse left button to enable rotation axes.
+
+Recording control:
+Click the opencv window (make sure it's in focus).
+Press "C" to start evaluation (hand control over to policy).
+Press "Q" to exit program.
+
+================ Policy in control ==============
+Make sure you can hit the robot hardware emergency-stop button quickly! 
+
+Recording control:
+Press "S" to stop evaluation and gain control back.
+"""
+
+# %%
+import time
+from multiprocessing.managers import SharedMemoryManager
+import click
+import cv2
+import numpy as np
+import torch
+import dill
+import hydra
+import pathlib
+import skvideo.io
+from omegaconf import OmegaConf
+import scipy.spatial.transform as st
+import imageio.v2 as imageio
+from diffusion_policy.real_world.rb10_real_env import RealEnv   # 새로 작성
+# from diffusion_policy.real_world.spacemouse_shared_memory import Spacemouse
+from diffusion_policy.common.precise_sleep import precise_wait
+from diffusion_policy.real_world.real_inference_util import (
+    get_real_obs_resolution, 
+    get_real_obs_dict)
+from diffusion_policy.common.pytorch_util import dict_apply
+from diffusion_policy.workspace.base_workspace import BaseWorkspace
+from diffusion_policy.policy.base_image_policy import BaseImagePolicy
+from diffusion_policy.common.cv2_util import get_image_transform
+
+
+OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+def _get_rgb_keys(shape_meta):
+    rgb_keys = []
+    for key, attr in shape_meta['obs'].items():
+        if attr.get('type', 'low_dim') == 'rgb':
+            rgb_keys.append(key)
+    return rgb_keys
+
+
+def _normalize_vis_image(img):
+    if img.dtype != np.uint8:
+        img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+    return img
+
+
+def _overlay_text_bgr(img_bgr, lines):
+    y = 24
+    for line in lines:
+        cv2.putText(
+            img_bgr, line, (10, y),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=0.6,
+            color=(0, 255, 0),
+            thickness=2,
+            lineType=cv2.LINE_AA
+        )
+        y += 22
+    return img_bgr
+
+
+def _draw_value_plot(values, width, height):
+    canvas = np.full((height, width, 3), 255, dtype=np.uint8)
+    if len(values) < 2:
+        return canvas
+    margin = 24
+    x0, y0 = margin, margin
+    x1, y1 = width - margin, height - margin
+    cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 0, 0), 1)
+    v_min = 0.0
+    v_max = max(1.0, float(np.max(values)))
+    xs = np.linspace(x0, x1, num=len(values))
+    ys = []
+    for v in values:
+        t = (v - v_min) / (v_max - v_min)
+        t = np.clip(t, 0.0, 1.0)
+        y = y1 - t * (y1 - y0)
+        ys.append(y)
+    pts = np.stack([xs, ys], axis=1).astype(np.int32)
+    cv2.polylines(canvas, [pts], isClosed=False, color=(0, 120, 255), thickness=2)
+    cv2.putText(
+        canvas, "pred_bin", (x0, y0 - 6),
+        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+        fontScale=0.5,
+        color=(0, 0, 0),
+        thickness=1,
+        lineType=cv2.LINE_AA
+    )
+    return canvas
+
+
+def _load_value_model(ckpt_path, device):
+    payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill)
+    cfg = payload['cfg']
+    model = hydra.utils.instantiate(cfg.model)
+    model.load_state_dict(payload['state_dicts']['model'])
+    model.to(device).eval()
+    return cfg, model
+
+
+def _write_value_video(out_path, frames_bgr, series, frame_indices, fps):
+    out_path = str(out_path)
+
+    def _write(writer_path, fmt=None):
+        kwargs = {"fps": fps}
+        if fmt is not None:
+            kwargs["format"] = fmt
+        with imageio.get_writer(writer_path, **kwargs) as writer:
+            for idx, frame_bgr in enumerate(frames_bgr):
+                series_idx = frame_indices[idx]
+                pred_bin = series[series_idx]
+                frame = _overlay_text_bgr(
+                    frame_bgr.copy(),
+                    [f"pred_bin={pred_bin}", f"t={series_idx + 1}"]
+                )
+                plot = _draw_value_plot(
+                    series[: series_idx + 1],
+                    width=max(200, frame.shape[1] // 2),
+                    height=frame.shape[0]
+                )
+                vis = np.concatenate([frame, plot], axis=1)
+                writer.append_data(vis[..., ::-1])
+
+    try:
+        _write(out_path, fmt="FFMPEG")
+        return out_path
+    except Exception:
+        if not out_path.lower().endswith(".gif"):
+            fallback = out_path + ".gif"
+        else:
+            fallback = out_path
+        _write(fallback, fmt=None)
+        return fallback
+
+
+def _save_value_video_if_needed(output_dir, episode_idx, frames, series, frame_indices, fps):
+    if len(frames) == 0:
+        return None
+    out_dir = pathlib.Path(output_dir).joinpath('value_videos')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir.joinpath(f'episode_{episode_idx:04d}.mp4')
+    return _write_value_video(out_path, frames, series, frame_indices, fps)
+
+
+@click.command()
+@click.option('--input', '-i', required=True, help='Path to checkpoint')   # checkpoint
+@click.option('--output', '-o', required=True, help='Directory to save recording')   
+@click.option('--robot_ip', '-ri', default="192.168.111.50", required=True, help="UR5's IP address e.g. 192.168.0.204")
+@click.option('--match_dataset', '-m', default=None, help='Dataset used to overlay and adjust initial condition')   
+@click.option('--match_episode', '-me', default=None, type=int, help='Match specific episode from the match dataset')
+@click.option('--vis_camera_idx', default=0, type=int, help="Which RealSense camera to visualize.")
+@click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robot joint configuration in the beginning.")
+@click.option('--steps_per_inference', '-si', default=6, type=int, help="Action horizon for inference.")   # 몇개의 action 실행할건지
+@click.option('--max_duration', '-md', default=40, help='Max duration for each epoch in seconds.')
+@click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")   # 20Hz ??
+@click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
+@click.option('--valuef', default=None, help='Value model checkpoint path for live graph')
+@click.option('--value_vis_every', default=2, type=int, help='Save value frames every N loops')
+@click.option('--debug_timing', is_flag=True, default=False, help='Print timing markers for debugging')
+def main(input, output, robot_ip, match_dataset, match_episode,
+    vis_camera_idx, init_joints, 
+    steps_per_inference, max_duration,
+    frequency, command_latency, valuef, value_vis_every, debug_timing):
+    
+
+    # load checkpoint; checkpoint의 cfg 및 파라미터들 다 가져옴
+    ckpt_path = input
+    payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill)
+    cfg = payload['cfg']   # yaml에 있던 변수들 설정값
+    cls = hydra.utils.get_class(cfg._target_)   # WorkSpace 설정
+    workspace = cls(cfg)
+    workspace: BaseWorkspace
+    workspace.load_payload(payload, exclude_keys=None, include_keys=None)
+    # 여기서 workspace.model에 cfg.policy가 들어감
+
+
+    # hacks for method-specific setup.
+    action_offset = 0
+    delta_action = False  
+    if 'diffusion' in cfg.name:
+        # diffusion model
+        policy: BaseImagePolicy
+        policy = workspace.model   # state_dicts의 model을 가져옴 (가중치 값들)
+        if cfg.training.use_ema:
+            policy = workspace.ema_model   # ema_model 가져옴 (가중치 값들)
+
+        device = torch.device('cuda')
+        policy.eval().to(device)
+
+        # set inference params
+        policy.num_inference_steps = 16 # DDIM inference iterations; 노이즈 제거 step 수
+        policy.n_action_steps = policy.horizon - policy.n_obs_steps + 1   # 과거부터 horizon 뽑고, obs만큼 빼고, 1 더하기
+
+    else:
+        raise RuntimeError("Unsupported policy type: ", cfg.name)
+
+    value_cfg = None
+    value_model = None
+    if valuef is not None:
+        value_cfg, value_model = _load_value_model(valuef, device)
+
+
+    # setup experiment
+    dt = 1/frequency
+
+    obs_res = get_real_obs_resolution(cfg.task.shape_meta)   # obs의 image 해상도 (width, height)
+    n_obs_steps = cfg.n_obs_steps   # obs 관측 step 수
+    print("n_obs_steps: ", n_obs_steps)   # obs 관측 step수 (2)
+    print("steps_per_inference:", steps_per_inference)   # 예측한 action sequence에서 몇개의 action 실행할건지 (6)
+    print("action_offset:", action_offset)   # action 지연 실행 (0)
+    rgb_keys = _get_rgb_keys(cfg.task.shape_meta)
+    if len(rgb_keys) == 0:
+        raise RuntimeError("No RGB keys found in shape_meta")
+    if vis_camera_idx >= len(rgb_keys):
+        raise RuntimeError("vis_camera_idx out of range for RGB keys")
+    vis_rgb_key = rgb_keys[vis_camera_idx]
+    episode_idx = 0
+
+
+    # sharedmemory에 데이터들 쌓기; 같은 공유 공간 사용
+    with SharedMemoryManager() as shm_manager:
+        with RealEnv(
+            output_dir=output, 
+            robot_ip=robot_ip, 
+            frequency=frequency,   
+            n_obs_steps=n_obs_steps,   
+            obs_image_resolution=obs_res,   # (84, 84)
+            obs_float32=True,   
+            init_joints=init_joints,   # False
+            enable_multi_cam_vis=True,   # 실시간 시각화 
+            record_raw_video=False,   # 영상 저장 
+            # number of threads per camera view for video recording (H.264)
+            thread_per_video=3,
+            # video recording quality, lower is better (but slower).
+            video_crf=21,
+            shm_manager=shm_manager) as env:
+            cv2.setNumThreads(1)
+
+
+            # Realsense-viewer에서 설정
+            # Should be the same as demo
+            # realsense exposure
+            # env.realsense.set_exposure(exposure=120, gain=0)
+            # realsense white balance
+            # env.realsense.set_white_balance(white_balance=5900)
+
+            print("Waiting for realsense")
+            time.sleep(1.0)
+
+            print("Warming up policy inference")
+            
+            # obs 받아오기
+            obs = env.get_obs()
+
+            with torch.no_grad():
+                policy.reset()
+
+                # 받은 obs에서 image 정규화 및 다듬기, pose 다듬기
+                obs_dict_np = get_real_obs_dict(
+                    env_obs=obs, shape_meta=cfg.task.shape_meta)
+                
+                # shape_meta 계층구조는 유지하면서 np --> tensor로 변환, 텐서 배치차원 추가
+                obs_dict = dict_apply(obs_dict_np, 
+                    lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
+                
+                # obs로 action 예측
+                result = policy.predict_action(obs_dict)   # {'action': ~ , 'action_pred': ~}
+                # 실제 실행할 action trajectory
+                action = result['action'][0].detach().to('cpu').numpy()   # [0]은 배치차원 제거, tensor --> np
+                assert action.shape[-1] == 10   # action 차원: 3 pos + 6 rot + 1 gripper
+                del result
+
+            print('Ready!')
+            while True:
+                
+                # ========== policy control loop ==============
+                value_frames = []
+                value_series = []
+                value_frame_indices = []
+                try:
+                    # start episode
+                    policy.reset()
+                    start_delay = 1.0
+                    eval_t_start = time.time() + start_delay   # 시스템시간, 영상 로그용
+                    t_start = time.monotonic() + start_delay   # 로봇 제어 시간
+
+                    env.start_episode(eval_t_start)   # 영상 저장 시작
+                    episode_idx += 1
+                    # wait for 1/30 sec to get the closest frame actually
+                    # reduces overall latency; 카메라 프레임 잘 받아오도록
+                    frame_latency = 1/30
+                    precise_wait(eval_t_start - frame_latency, time_func=time.time)
+                    print("Started!")
+                    iter_idx = 0   # trajectory 실행 개수
+                    term_area_start_timestamp = float('inf')
+                    perv_target_pose = None
+                    while True:
+                        # calculate timing; 실행할 action 만큼 기다릴 시간
+                        t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
+
+                        if debug_timing:
+                            print(f"[TIMING] before_get_obs t={time.time():.3f}")
+                        print('get_obs')
+                        obs = env.get_obs()
+                        if debug_timing:
+                            print(f"[TIMING] after_get_obs t={time.time():.3f}")
+                        obs_timestamps = obs['timestamp']
+                        print(f'Obs latency {time.time() - obs_timestamps[-1]}')
+
+                        # run inference; action 예측
+                        with torch.no_grad():
+                            if debug_timing:
+                                print(f"[TIMING] before_policy_infer t={time.time():.3f}")
+                            s = time.time()
+                            obs_dict_np = get_real_obs_dict(
+                                env_obs=obs, shape_meta=cfg.task.shape_meta)
+                            obs_dict = dict_apply(obs_dict_np, 
+                                lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
+                            # action 예측 
+                            result = policy.predict_action(obs_dict)
+                            # this action starts from the first obs step
+                            action = result['action'][0].detach().to('cpu').numpy()   # 실행할 action[Horizon, Action_Dim]
+                            print('Inference latency:', time.time() - s)
+                            if debug_timing:
+                                print(f"[TIMING] after_policy_infer t={time.time():.3f}")
+                        
+                            if value_model is not None:
+                                if debug_timing:
+                                    print(f"[TIMING] before_value_infer t={time.time():.3f}")
+                                
+                                # 1. Value 모델용 관측 데이터 가져오기
+                                if hasattr(value_cfg, 'task') and hasattr(value_cfg.task, 'shape_meta'):
+                                    v_shape_meta = value_cfg.task.shape_meta
+                                else:
+                                    v_shape_meta = value_cfg.shape_meta
+                                    
+                                value_obs_np = get_real_obs_dict(
+                                    env_obs=obs, shape_meta=v_shape_meta)
+
+                                # 2. 전처리: (T, C, H, W) -> (1, C, H, W) 
+                                # 과거 데이터(T) 중 가장 최신 것([-1])만 가져오고, float32로 변환합니다.
+                                value_obs_input = dict()
+                                for k, v in value_obs_np.items():
+                                    # v의 형태: (Time, Channel, Height, Width)
+                                    # [-1] 인덱싱으로 마지막 프레임 추출
+                                    # [수정] dtype=torch.float32 추가하여 자료형 일치시킴
+                                    obs_tensor = torch.from_numpy(v[-1]).to(device, dtype=torch.float32)
+                                    
+                                    # 배치 차원 추가: (1, 3, 216, 288)
+                                    value_obs_input[k] = obs_tensor.unsqueeze(0)
+
+                                # 3. 모델 추론
+                                logits = value_model(value_obs_input)
+                                pred_bin = int(torch.argmax(logits, dim=-1).item())
+                                value_series.append(pred_bin)
+                                
+                                if debug_timing:
+                                    print(f"[TIMING] after_value_infer t={time.time():.3f}")
+
+                                # 4. 시각화 데이터 저장
+                                frame = _normalize_vis_image(obs[vis_rgb_key][-1]).copy()
+                                if (iter_idx % max(1, value_vis_every)) == 0:
+                                    value_frames.append(frame)
+                                    value_frame_indices.append(len(value_series) - 1)
+                            # ▲▲▲ [수정된 코드 끝] ▲▲▲
+
+                        # convert policy action to env actions
+                        if delta_action:   # False
+                            assert len(action) == 1
+                            if perv_target_pose is None:
+                                perv_target_pose = obs['robot_eef_pose'][-1]
+                            this_target_pose = perv_target_pose.copy()
+                            this_target_pose[[0,1]] += action[-1]
+                            perv_target_pose = this_target_pose
+                            this_target_poses = np.expand_dims(this_target_pose, axis=0)
+
+                        else:   # len(action): Horizon / len(target_pose): 9
+                            this_target_poses = np.zeros((len(action), action.shape[-1]), dtype=np.float64)
+                            # this_target_poses[:] = target_pose
+                            # this_target_poses[:,[0,1]] = action   
+                            this_target_poses[:, :action.shape[-1]] = action
+
+                        # deal with timing
+                        # the same step actions are always the target for
+                        action_timestamps = (np.arange(len(action), dtype=np.float64) + action_offset
+                            ) * dt + obs_timestamps[-1]
+                        action_exec_latency = 0.01
+                        curr_time = time.time()
+                        is_new = action_timestamps > (curr_time + action_exec_latency)   # 현재시점 이후 action만 실행
+                        
+                        if np.sum(is_new) == 0:   # 전부 지나버림
+                            # exceeded time budget, still do something
+                            this_target_poses = this_target_poses[[-1]]   # 마지막 action이라도 실행
+                            # schedule on next available step
+                            next_step_idx = int(np.ceil((curr_time - eval_t_start) / dt))
+                            action_timestamp = eval_t_start + (next_step_idx) * dt
+                            print('Over budget', action_timestamp - curr_time)
+                            action_timestamps = np.array([action_timestamp])
+
+                        else:   # is_new = 1 인것만 실행
+                            this_target_poses = this_target_poses[is_new]
+                            action_timestamps = action_timestamps[is_new]
+
+                        # clip actions; 범위 바꿈
+                        # this_target_poses[:,:2] = np.clip(
+                        #     this_target_poses[:,:2], [0.25, -0.45], [0.77, 0.40])
+                        # delta action이라 clip 안함!!!!!!!!!!!!!!!!!!!!!!!!!!
+                        # this_target_poses[:,:3] = np.clip(
+                        #     this_target_poses[:,:3], [-0.50, -0.90, 0.095], [0.40, -0.37, 0.81])
+                        
+                        # execute actions; 실제 action 실행부분; 
+                        if debug_timing:
+                            print(f"[TIMING] before_exec_actions t={time.time():.3f}")
+                        env.exec_actions(
+                            actions=this_target_poses,
+                            timestamps=action_timestamps
+                        )
+                        if debug_timing:
+                            print(f"[TIMING] after_exec_actions t={time.time():.3f}")
+                        print(f"Submitted {len(this_target_poses)} steps of actions.")
+
+
+                        # 's' 누르면 종료
+                        key_stroke = cv2.pollKey()
+                        if key_stroke == ord('s'):
+                            # Stop episode
+                            # Hand control back to human
+                            env.end_episode()
+                            if value_model is not None:
+                                saved = _save_value_video_if_needed(
+                                    output, episode_idx, value_frames, value_series, value_frame_indices, fps=frequency)
+                                if saved is not None:
+                                    print(f"Saved value video to {saved}")
+                            print('Stopped.')
+                            break
+
+
+                        # auto termination; 한계시간 지나면 종료
+                        terminate = False
+                        if time.monotonic() - t_start > max_duration:
+                            terminate = True
+                            print('Terminated by the timeout!')
+
+                        if terminate:
+                            env.end_episode()
+                            if value_model is not None:
+                                saved = _save_value_video_if_needed(
+                                    output, episode_idx, value_frames, value_series, value_frame_indices, fps=frequency)
+                                if saved is not None:
+                                    print(f"Saved value video to {saved}")
+                            break
+
+
+                        # wait for execution; 로봇이 action 여러개 실행할동안 기다림
+                        if debug_timing:
+                            print(f"[TIMING] before_wait t={time.time():.3f}")
+                        precise_wait(t_cycle_end - frame_latency)
+                        if debug_timing:
+                            print(f"[TIMING] after_wait t={time.time():.3f}")
+                        iter_idx += steps_per_inference
+
+                except KeyboardInterrupt:
+                    print("Interrupted!")
+                    # stop robot.
+                    env.end_episode()
+                    if value_model is not None:
+                        saved = _save_value_video_if_needed(
+                            output, episode_idx, value_frames, value_series, value_frame_indices, fps=frequency)
+                        if saved is not None:
+                            print(f"Saved value video to {saved}")
+                
+                print("Stopped.")
+
+
+
+# %%
+if __name__ == '__main__':
+    main()
