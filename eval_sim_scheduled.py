@@ -14,10 +14,11 @@ from scipy.spatial.transform import Rotation as R
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
+from diffusion_policy.common.precise_sleep import precise_wait
+from diffusion_policy.common.pose_trajectory_interpolator import PoseTrajectoryInterpolator
 from diffusion_policy.sim_world import (
     SimEnvAdapterSonAdv,
     ObsWindowSync,
-    ActionScheduler,
     EvalMetrics,
 )
 
@@ -124,6 +125,76 @@ def _to_osc_delta_action(
     return np.clip(action7, low, high)
 
 
+def _action_to_abs_pose7(
+    action_raw: np.ndarray,
+    obs_now: dict,
+    pos_output_max: float,
+    rot_output_max: float,
+) -> np.ndarray:
+    action_raw = np.asarray(action_raw, dtype=np.float32).reshape(-1)
+    curr_pos = np.asarray(obs_now["position"], dtype=np.float32).reshape(3)
+    curr_quat_xyzw = np.asarray(obs_now["quat"], dtype=np.float32).reshape(4)
+    curr_rot = R.from_quat(curr_quat_xyzw).as_matrix()
+
+    if action_raw.shape[0] == 10:
+        target_pos = action_raw[:3]
+        target_rot = _rot6d_to_matrix(action_raw[3:9])
+        target_gripper_abs = float(action_raw[9])
+    elif action_raw.shape[0] == 8:
+        target_pos = action_raw[:3]
+        target_quat_xyzw = action_raw[3:7]
+        target_quat_xyzw = target_quat_xyzw / (np.linalg.norm(target_quat_xyzw) + 1e-8)
+        target_rot = R.from_quat(target_quat_xyzw).as_matrix()
+        target_gripper_abs = float(action_raw[7])
+    elif action_raw.shape[0] == 7:
+        dpos = action_raw[:3] * float(pos_output_max)
+        drot_axis_angle = action_raw[3:6] * float(rot_output_max)
+        target_pos = curr_pos + dpos
+        target_rot = R.from_rotvec(drot_axis_angle).as_matrix() @ curr_rot
+        g_cmd = float(np.clip(action_raw[6], -1.0, 1.0))
+        target_gripper_abs = 0.5 * (g_cmd + 1.0)
+    else:
+        raise ValueError(
+            f"Unsupported action dim {action_raw.shape[0]} for waypoint scheduling. "
+            "Expected 7, 8, or 10."
+        )
+
+    target_rotvec = R.from_matrix(target_rot).as_rotvec().astype(np.float32)
+    target_pose7 = np.concatenate(
+        [np.asarray(target_pos, dtype=np.float32), target_rotvec, np.asarray([target_gripper_abs], dtype=np.float32)]
+    )
+    return target_pose7
+
+
+def _abs_pose7_to_osc_delta_action(
+    target_pose7: np.ndarray,
+    obs_now: dict,
+    low: np.ndarray,
+    high: np.ndarray,
+    pos_output_max: float,
+    rot_output_max: float,
+    binarize_gripper: bool,
+) -> np.ndarray:
+    target_pose7 = np.asarray(target_pose7, dtype=np.float32).reshape(7)
+    target_pos = target_pose7[:3]
+    target_rot = R.from_rotvec(target_pose7[3:6]).as_matrix()
+    target_gripper_abs = float(target_pose7[6])
+
+    curr_pos = np.asarray(obs_now["position"], dtype=np.float32).reshape(3)
+    curr_quat_xyzw = np.asarray(obs_now["quat"], dtype=np.float32).reshape(4)
+    curr_rot = R.from_quat(curr_quat_xyzw).as_matrix()
+
+    delta_rot = target_rot @ curr_rot.T
+    drot_axis_angle = R.from_matrix(delta_rot).as_rotvec().astype(np.float32)
+    dpos = (target_pos - curr_pos).astype(np.float32)
+
+    pos_cmd = dpos / float(pos_output_max)
+    rot_cmd = drot_axis_angle / float(rot_output_max)
+    grip_cmd = np.array([_gripper_abs_to_cmd(target_gripper_abs, binarize_gripper)], dtype=np.float32)
+    action7 = np.concatenate([pos_cmd, rot_cmd, grip_cmd], axis=0).astype(np.float32)
+    return np.clip(action7, low, high)
+
+
 @click.command()
 @click.option("--input", "-i", required=True, help="Path to checkpoint")
 @click.option("--output", "-o", required=True, help="Directory to save logs")
@@ -184,7 +255,8 @@ def main(
         policy.advantage_inference_value = int(advantage_inference_value)
 
     dt = 1.0 / float(frequency)
-    scheduler = ActionScheduler(dt=dt, action_offset=0, exec_latency=0.01)
+    action_offset = 0
+    action_exec_latency = 0.01
 
     env = SimEnvAdapterSonAdv(
         env_name="Lift",
@@ -210,8 +282,25 @@ def main(
 
             low, high = env.action_spec()
             done = False
+            step_count = 0
+            iter_idx = 0
+            t_start = time.monotonic()
+            curr_rotvec = R.from_quat(np.asarray(obs["quat"], dtype=np.float32).reshape(4)).as_rotvec().astype(np.float32)
+            curr_gripper = float(np.asarray(obs["gripper"], dtype=np.float32).reshape(-1)[0])
+            init_pose7 = np.concatenate(
+                [
+                    np.asarray(obs["position"], dtype=np.float32).reshape(3),
+                    curr_rotvec,
+                    np.asarray([curr_gripper], dtype=np.float32),
+                ]
+            )
+            pose_interp = PoseTrajectoryInterpolator(
+                times=np.array([time.monotonic()], dtype=np.float64),
+                poses=np.array([init_pose7], dtype=np.float64),
+            )
+            last_waypoint_time = pose_interp.times[-1]
 
-            for _ in range(max_steps):
+            while (not done) and (step_count < max_steps):
                 if render:
                     env.render()
 
@@ -234,18 +323,55 @@ def main(
                 infer_ms = (time.time() - t0) * 1000.0
                 metrics.add_infer_ms(infer_ms)
 
-                kept_actions, dropped, kept = scheduler.schedule(action_seq, time.time())
-                cycle_actions = scheduler.take_cycle(kept_actions, steps_per_inference)
-                metrics.add_action_counts(len(action_seq), len(cycle_actions), dropped + (kept - len(cycle_actions)))
+                obs_timestamp = time.time()
+                action_timestamps = (
+                    np.arange(len(action_seq), dtype=np.float64) + action_offset
+                ) * dt + obs_timestamp
+                curr_time = time.time()
+                is_new = action_timestamps > (curr_time + action_exec_latency)
+                if np.sum(is_new) == 0:
+                    this_actions = action_seq[[-1]]
+                    next_step_idx = int(np.ceil((curr_time - obs_timestamp) / dt))
+                    if next_step_idx < 1:
+                        next_step_idx = 1
+                    action_timestamps = np.array([obs_timestamp + next_step_idx * dt], dtype=np.float64)
+                else:
+                    this_actions = action_seq[is_new]
+                    action_timestamps = action_timestamps[is_new]
 
-                if len(cycle_actions) == 0:
-                    cycle_actions = action_seq[[-1]]
+                this_actions = this_actions[:steps_per_inference]
+                action_timestamps = action_timestamps[:steps_per_inference]
+                metrics.add_action_counts(
+                    len(action_seq),
+                    len(this_actions),
+                    max(0, len(action_seq) - len(this_actions)),
+                )
 
-                for a in cycle_actions:
+                for a, t_cmd in zip(this_actions, action_timestamps):
+                    target_pose7 = _action_to_abs_pose7(
+                        action_raw=a,
+                        obs_now=obs,
+                        pos_output_max=osc_pos_output_max,
+                        rot_output_max=osc_rot_output_max,
+                    )
+                    target_time_mono = time.monotonic() - time.time() + float(t_cmd)
+                    curr_time_mono = time.monotonic() + dt
+                    pose_interp = pose_interp.schedule_waypoint(
+                        pose=target_pose7,
+                        time=target_time_mono,
+                        max_pos_speed=np.inf,
+                        max_rot_speed=np.inf,
+                        curr_time=curr_time_mono,
+                        last_waypoint_time=last_waypoint_time,
+                    )
+                    last_waypoint_time = pose_interp.times[-1]
+
+                    precise_wait(t_cmd, time_func=time.time)
                     obs_gripper_in = float(np.asarray(obs["gripper"]).reshape(-1)[0])
                     raw_gripper = float(np.asarray(a).reshape(-1)[-1])
-                    a_exec = _to_osc_delta_action(
-                        action_raw=a,
+                    interp_pose7 = pose_interp(time.monotonic())
+                    a_exec = _abs_pose7_to_osc_delta_action(
+                        target_pose7=interp_pose7,
                         obs_now=obs,
                         low=low,
                         high=high,
@@ -262,10 +388,13 @@ def main(
                     obs, r, done, _ = env.step(a_exec)
                     metrics.add_reward(float(r))
                     sync.push(obs)
+                    step_count += 1
                     if done:
                         break
-                if done:
-                    break
+
+                t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
+                precise_wait(t_cycle_end, time_func=time.monotonic)
+                iter_idx += steps_per_inference
 
             summary = metrics.summary()
             summary["episode"] = ep
