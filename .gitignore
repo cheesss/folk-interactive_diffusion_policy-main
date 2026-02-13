@@ -33,3 +33,7 @@ data/outputs/
 **/*.gif
 outputs/
 wandb/
+
+# local collection outputs
+log/
+inference_data/
