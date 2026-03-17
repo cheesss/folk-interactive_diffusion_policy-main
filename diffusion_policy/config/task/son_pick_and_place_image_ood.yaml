@@ -1,0 +1,35 @@
+name: son_pick_and_place_image_ood
+
+expert_dataset_path: /home/ws/Downloads/common_data_integ.hdf5
+rollout_dataset_paths: []
+
+shape_meta: &shape_meta
+  obs:
+    image0:
+      shape: [3, 240, 320]
+      type: rgb
+    image1:
+      shape: [3, 240, 320]
+      type: rgb
+    position:
+      shape: [3]
+      type: low_dim
+    quat:
+      shape: [4]
+      type: low_dim
+    gripper:
+      shape: [1]
+      type: low_dim
+  action:
+    shape: [10]
+
+dataset:
+  _target_: diffusion_policy.dataset.son_replay_ood_dynamics_dataset.SonReplayOODDynamicsDataset
+  shape_meta: *shape_meta
+  expert_dataset_path: ${task.expert_dataset_path}
+  rollout_dataset_paths: ${task.rollout_dataset_paths}
+  action_horizon: ${action_horizon}
+  seed: 42
+  val_ratio: 0.1
+  abs_action: True
+  use_cache: False

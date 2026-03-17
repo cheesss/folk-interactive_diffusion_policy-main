@@ -1,0 +1,13 @@
+defaults:
+  - _self_
+  - task: son_pick_and_place_image_ood
+
+reference_policy:
+  checkpoint: /home/ws/path/to/base_policy.ckpt
+  use_ema: True
+
+export:
+  output_path: outputs/ood_assets/expert_latent_bank.pt
+  device: cuda:0
+  batch_size: 64
+  chunk_size: 2048

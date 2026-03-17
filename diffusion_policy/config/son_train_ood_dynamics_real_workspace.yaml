@@ -1,0 +1,83 @@
+defaults:
+  - _self_
+  - task: son_pick_and_place_image_ood
+
+name: train_ood_dynamics_real
+_target_: diffusion_policy.workspace.train_ood_dynamics_workspace.TrainOODDynamicsWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+action_horizon: 6
+
+reference_policy:
+  checkpoint: /home/ws/path/to/base_policy.ckpt
+  use_ema: True
+
+model:
+  _target_: diffusion_policy.model.ood.latent_dynamics_model.LatentDynamicsModel
+  latent_dim: null
+  proprio_dim: null
+  action_dim: null
+  hidden_dim: 512
+  proprio_emb_dim: 128
+  action_emb_dim: 128
+  num_layers: 6
+  num_heads: 16
+  dropout: 0.1
+  max_action_horizon: ${action_horizon}
+
+dataloader:
+  batch_size: 64
+  num_workers: 12
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 12
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  num_epochs: 100
+  max_train_steps: null
+  max_val_steps: null
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  val_every: 5
+  checkpoint_every: 5
+  tqdm_interval_sec: 1.0
+  proprio_loss_weight: 0.25
+
+logging:
+  project: diffusion_policy_ood
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.4f}.ckpt'
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
