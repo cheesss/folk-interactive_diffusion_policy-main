@@ -152,3 +152,40 @@ Assuming the training has finished and you have a checkpoint at `data/outputs/bl
 ```console
 python bae_eval_real_robot.py --input data/outputs/blah/checkpoints/latest.ckpt --output data/results
 ```
+
+## Simulation Scheduled Eval Entry
+
+Added local simulation entrypoint:
+
+- `eval_sim_scheduled.py`
+
+Added helper modules:
+
+- `diffusion_policy/sim_world/sim_env_adapter_son_adv.py`
+- `diffusion_policy/sim_world/sim_obs_sync.py`
+- `diffusion_policy/sim_world/sim_action_scheduler.py`
+- `diffusion_policy/sim_world/sim_eval_metrics.py`
+
+Environment note:
+
+- This implementation uses installed `robosuite` / `robomimic` from the active conda env.
+- Conda env hotfix applied on Windows (`idp_robodiff`) to fix `robosuite` import:
+  - copied
+    `C:\Users\chohj\anaconda3\envs\idp_robodiff\Lib\site-packages\mujoco\mujoco.dll`
+    ->
+    `C:\Users\chohj\anaconda3\envs\idp_robodiff\Lib\site-packages\robosuite\utils\mujoco.dll`
+
+Run:
+
+```bash
+python eval_sim_scheduled.py --input <ckpt> --output <out_dir> --task son_pick_and_place_image_adv
+```
+
+Absolute-action bridge:
+
+- If policy outputs absolute `10D` action (`xyz + rot6d + gripper_abs`), `eval_sim_scheduled.py` now converts it to OSC `7D` delta command before `env.step(...)`.
+- Position / rotation command scaling uses:
+  - `--osc_pos_output_max` (default `0.05`)
+  - `--osc_rot_output_max` (default `0.5`)
+- Gripper mapping can be toggled with:
+  - `--binarize_gripper` (default) or `--continuous_gripper`
