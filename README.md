@@ -1,154 +1,110 @@
-# Diffusion Policy
+# Recovery-Aware LPB for RMP-Induced OOD States
 
-[[Project page]](https://diffusion-policy.cs.columbia.edu/)
-[[Paper]](https://diffusion-policy.cs.columbia.edu/#paper)
-[[Data]](https://diffusion-policy.cs.columbia.edu/data/)
-[[Colab (state)]](https://colab.research.google.com/drive/1gxdkgRVfM55zihY9TFLja97cSVZOZq2B?usp=sharing)
-[[Colab (vision)]](https://colab.research.google.com/drive/18GIHeOQ5DyjMN8iIRZL2EKZ0745NLIpg?usp=sharing)
+Research code for detecting states created by reactive safety interventions and guiding an RB10 manipulator back toward task-relevant behavior.
 
+**Reported result:** recovery-aware LPB completed **146 of 160 RB10 trials (91.3%)** in the evaluated intervention setting. The manuscript and broader evaluation are in preparation.
 
-[Cheng Chi](http://cheng-chi.github.io/)<sup>1</sup>,
-[Siyuan Feng](https://www.cs.cmu.edu/~sfeng/)<sup>2</sup>,
-[Yilun Du](https://yilundu.github.io/)<sup>3</sup>,
-[Zhenjia Xu](https://www.zhenjiaxu.com/)<sup>1</sup>,
-[Eric Cousineau](https://www.eacousineau.com/)<sup>2</sup>,
-[Benjamin Burchfiel](http://www.benburchfiel.com/)<sup>2</sup>,
-[Shuran Song](https://www.cs.columbia.edu/~shurans/)<sup>1</sup>
+[Research portfolio](https://cheesss.github.io/research/recovery-aware-lpb/) · [Implementation map](./OOD_CHANGE_LOG.md) · [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/)
 
-<sup>1</sup>Columbia University,
-<sup>2</sup>Toyota Research Institute,
-<sup>3</sup>MIT
+## Research question
 
-<img src="media/teaser.png" alt="drawing" width="100%"/>
-<img src="media/multimodal_sim.png" alt="drawing" width="100%"/>
+A reactive motion policy can keep a robot away from an obstacle, but the intervention may move the robot outside the state distribution represented by its demonstrations. Once control returns to the learned task policy, that policy may not know how to recover.
 
-## 🛝 Try it out!
-Our self-contained Google Colab notebooks is the easiest way to play with Diffusion Policy. We provide separate notebooks for  [state-based environment](https://colab.research.google.com/drive/1gxdkgRVfM55zihY9TFLja97cSVZOZq2B?usp=sharing) and [vision-based environment](https://colab.research.google.com/drive/18GIHeOQ5DyjMN8iIRZL2EKZ0745NLIpg?usp=sharing).
+This project asks:
 
+> Can a policy bridge detect intervention-induced out-of-distribution states and steer the learned policy back toward demonstrated task behavior?
 
+## Reported evaluation
 
-## 🛠️ Installation
-### 🖥️ Simulation
-To reproduce our simulation benchmark results, install our conda environment on a Linux machine with Nvidia GPU. On Ubuntu 20.04 you need to install the following apt packages for mujoco:
-```console
-$ sudo apt install -y libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf
+| Method | Task success | Scope |
+| --- | ---: | --- |
+| Base policy | 25.0% | No recovery-specific adaptation |
+| Policy fine-tuning | 63.8% | Direct adaptation baseline |
+| Original LPB | 64.4% | Policy-bridge baseline |
+| **Recovery-aware LPB** | **91.3% (146/160)** | Same reported intervention setting |
+
+These values summarize the current RB10 evaluation. Per-condition records, checkpoints, and the finalized protocol will accompany the manuscript; they are not included in this public repository.
+
+## System overview
+
+```mermaid
+flowchart LR
+    A[Task diffusion policy] --> B[Candidate action chunk]
+    B --> C[RMP safety intervention]
+    C --> D[Intervention-induced OOD state]
+    D --> E[Current and predicted OOD scores]
+    F[Expert latent bank] --> E
+    G[Latent dynamics model] --> E
+    E --> H[LPB recovery guidance]
+    H --> A
+    A --> I[Return to task execution]
 ```
 
-We recommend [Mambaforge](https://github.com/conda-forge/miniforge#mambaforge) instead of the standard anaconda distribution for faster installation: 
-```console
-$ mamba env create -f conda_environment.yaml
-```
+The public code covers the OOD monitoring and latent-dynamics path used to study this recovery mechanism. The full experimental branch remains private while the manuscript is in preparation.
 
-but you can use conda as well: 
-```console
-$ conda env create -f conda_environment.yaml
-```
+## What I added
 
-The `conda_environment_macos.yaml` file is only for development on MacOS and does not have full support for benchmarks.
+This repository started from the open-source Diffusion Policy codebase. The project-specific additions are separated from the upstream implementation and summarized below.
 
-### 🦾 Real Robot
-Hardware (for Push-T):
-* 1x RB10
-* 1x D405, D435I
-* 1x VR tracker (for teleop)
+| Component | Purpose |
+| --- | --- |
+| `rb10_eval_real_robot_ood.py` | RB10 inference entry point with OOD monitoring and runtime validation |
+| `diffusion_policy/real_world/ood_monitor.py` | Current and predicted OOD scoring against expert latent support |
+| `diffusion_policy/common/ood_utils.py` | Observation encoding, nearest-neighbor distance, and score normalization |
+| `diffusion_policy/model/ood/latent_dynamics_model.py` | Future-latent prediction conditioned on the current state and action horizon |
+| `diffusion_policy/workspace/train_ood_dynamics_workspace.py` | Training workspace for the latent dynamics model |
+| `diffusion_policy/dataset/son_replay_ood_dynamics_dataset.py` | Expert and rollout HDF5 conversion for dynamics training |
+| `diffusion_policy/scripts/export_ood_assets.py` | Expert latent-bank export using the frozen task-policy encoder |
+| `diffusion_policy/config/son_train_ood_dynamics_real_workspace.yaml` | OOD-dynamics training configuration |
+| `diffusion_policy/config/son_export_ood_assets.yaml` | Latent-bank export configuration |
 
+See [OOD_CHANGE_LOG.md](./OOD_CHANGE_LOG.md) for the implementation-level map.
 
-Software:
-* Ubuntu 20.04.3 (tested)
+## Research workflow
 
+1. Train the visual diffusion policy on expert demonstrations.
+2. Encode expert observations into a latent reference bank.
+3. Collect policy rollout data, including intervention-induced states.
+4. Train a latent dynamics model to predict future representation drift.
+5. Compute current and predicted OOD scores during RB10 inference.
+6. Apply recovery guidance when the intervention moves the robot outside demonstrated support.
 
-## 🖥️ Reproducing Simulation Benchmark Results 
-### Download Training Data
-Under the repo root, create data subdirectory:
-```console
-[diffusion_policy]$ mkdir data && cd data
-```
+## Public repository scope
 
-Download the corresponding zip file from [https://diffusion-policy.cs.columbia.edu/data/training/](https://diffusion-policy.cs.columbia.edu/data/training/)
-```console
-[data]$ wget https://diffusion-policy.cs.columbia.edu/data/training/pusht.zip
-```
+Included:
 
-Extract training data:
-```console
-[data]$ unzip pusht.zip && rm -f pusht.zip && cd ..
-```
+- OOD monitoring and visualization code
+- latent-bank export utilities
+- latent-dynamics model and training workspace
+- RB10 research integration scaffolding
+- configuration files for the public research path
 
-Grab config file for the corresponding experiment:
-```console
-[diffusion_policy]$ wget -O image_pusht_diffusion_policy_cnn.yaml https://diffusion-policy.cs.columbia.edu/data/experiments/image/pusht/diffusion_policy_cnn/config.yaml
-```
+Not included:
 
-### Running for a single seed
-Activate conda environment and login to [wandb](https://wandb.ai) (if you haven't already).
-```console
-[diffusion_policy]$ conda activate robodiff
-(robodiff)[diffusion_policy]$ wandb login
-```
+- robot demonstration and rollout datasets
+- trained policy, dynamics, or LPB checkpoints
+- unpublished per-condition trial records
+- the full private experimental branch used for the manuscript
 
-Launch training with seed 42 on GPU 0.
-```console
-(robodiff)[diffusion_policy]$ python train.py --config-dir=. --config-name=image_pusht_diffusion_policy_cnn.yaml training.seed=42 training.device=cuda:0 hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
-```
+Code and additional materials are available to research collaborators upon request.
 
-This will create a directory in format `data/outputs/yyyy.mm.dd/hh.mm.ss_<method_name>_<task_name>` where configs, logs and checkpoints are written to. The policy will be evaluated every 50 epochs with the success rate logged as `test/mean_score` on wandb, as well as videos for some rollouts.
-```console
-(robodiff)[diffusion_policy]$ tree data/outputs/2023.03.01/20.02.03_train_diffusion_unet_hybrid_pusht_image -I wandb
-data/outputs/2023.03.01/20.02.03_train_diffusion_unet_hybrid_pusht_image
-├── checkpoints
-│   ├── epoch=0000-test_mean_score=0.134.ckpt
-│   └── latest.ckpt
-├── .hydra
-│   ├── config.yaml
-│   ├── hydra.yaml
-│   └── overrides.yaml
-├── logs.json.txt
-├── media
-│   ├── 2k5u6wli.mp4
-│   ├── 2kvovxms.mp4
-│   ├── 2pxd9f6b.mp4
-│   ├── 2q5gjt5f.mp4
-│   ├── 2sawbf6m.mp4
-│   └── 538ubl79.mp4
-└── train.log
+## Status and limitations
 
-3 directories, 13 files
-```
+- **Status:** manuscript in preparation
+- The reported result is specific to the evaluated task distribution and intervention protocol.
+- This repository is a research snapshot, not a turn-key benchmark release.
+- Hardware-specific paths and checkpoints must be configured before real-robot execution.
 
+## Upstream work and attribution
 
-## 🦾 Demo, Training and Eval on a Real Robot
+This research repository is built on [Diffusion Policy](https://github.com/real-stanford/diffusion_policy):
 
-Make hdf5 dataset for RB10 robot. Press 's' to start saving data and 'q' to quit. Then, a prompt will appear asking whether to save this demo data: y/n. When you have collected the desired number of demos, press 't' to terminate.
+> Cheng Chi et al., “Diffusion Policy: Visuomotor Policy Learning via Action Diffusion,” *Robotics: Science and Systems*, 2023.
 
-```console
-(robodiff)[diffusion_policy]$ python bae_hdf_maker_abs.py
-```
-Data format
-```console
-data
- - demo_0
-   - obs
-     - robot_eef_pos (3)
-     - robot_eef_quat (4)
-     - image0 (240, 320)
-     - image1 (240, 320)
-   - actions (9)
- 
- - demo_1
-   ...
-```
+The upstream license is retained in [LICENSE](./LICENSE). Project-specific claims and experimental results in this README refer to Hyeonjun Cho's research extension, not to the upstream authors.
 
+## Contact
 
-Train a Diffusion Policy. You can train on various tasks and settings by specifying different configurations. And you can also adjust hyperparameters or dataset in config.
+Hyeonjun Cho · Sungkyunkwan University
 
-
-```console
-(robodiff)[diffusion_policy]$ python train.py --config-name=bae_train_diffusion_transformer_real_hybrid_workspace task=bae_push_image_abs
-```
-
-
-Assuming the training has finished and you have a checkpoint at `data/outputs/blah/checkpoints/latest.ckpt`, launch the evaluation script with:
-
-```console
-python bae_eval_real_robot.py --input data/outputs/blah/checkpoints/latest.ckpt --output data/results
-```
+[Research portfolio](https://cheesss.github.io/) · [GitHub](https://github.com/cheesss)
